@@ -759,11 +759,46 @@ python deploy.py --promote vault-dr
 
 **Opção B — De dentro do container DR:**
 ```bash
-docker exec -it vault-dr vault-promote
+docker exec -it vault-dr vaultctl promote
 ```
-*(Também suporta `vault-promote --force` se necessário)*
+*(Também suporta `vaultctl promote --force` se necessário)*
 
 O comando valida a ausência do master ativo, aciona `pg_ctl promote`, encerra o estado de recuperação do PostgreSQL e converte a API para o papel de escrita (`read_only: false`). O `GET /health` passa a responder imediatamente `role: primary`.
+
+---
+
+### 5. Multi-VPS com mTLS e Seeds (Estilo CyberArk Conjur)
+
+Para cenários onde os nós Primário e Standby (ou múltiplos Standbys) rodam em **VPSs ou servidores separados**:
+
+A replicação PostgreSQL e a comunicação entre nós utilizam **mTLS (Mutual TLS)** obrigatório com verificação estrita de certificados (`clientcert=verify-full`), garantindo que o tráfego de replicação entre VPSs viaje 100% criptografado e imune a escutas ou conexões não autorizadas.
+
+#### Passo 1: No nó Primário (VPS 1)
+Gere o pacote seed exclusivo para o nó Standby informando o IP ou hostname da VPS remota:
+
+```bash
+docker exec -it vault-primary vaultctl seed standby 10.10.20.20 --primary-host 10.10.20.10 --output /tmp/node2.seed.tar
+docker cp vault-primary:/tmp/node2.seed.tar ./node2.seed.tar
+```
+*O comando gera o certificado de nó para o IP do Standby, emite o certificado de cliente replicator mTLS assinado pela Root CA interna e empacota junto com a `master.key`.*
+
+#### Passo 2: Copie o arquivo para a VPS Standby (VPS 2)
+```bash
+scp node2.seed.tar usuario@10.10.20.20:/home/usuario/
+```
+
+#### Passo 3: Na VPS Standby (VPS 2)
+Desempacote e configure o nó:
+```bash
+python3 -m cli.vaultctl join --seed node2.seed.tar --output-dir ./vault-config
+```
+O comando exibe o `docker run` pronto para inicializar o nó Standby conectando via mTLS ao Primário.
+
+#### Inspecionar Certificados X.509
+Você pode inspecionar a validade e SANs de qualquer certificado a qualquer momento:
+```bash
+vaultctl certs inspect ./vault-init-output/tls/server.crt
+```
 
 ---
 

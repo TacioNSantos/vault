@@ -122,14 +122,25 @@ def is_initialized(name):
 
 
 def wait_for_api(name, port):
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
     for _ in range(30):
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode())
-                    return data
-        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected, ConnectionResetError):
-            pass
+        for proto in ("http", "https"):
+            try:
+                with urllib.request.urlopen(
+                    f"{proto}://127.0.0.1:{port}/health",
+                    timeout=1,
+                    context=ctx if proto == "https" else None,
+                ) as response:
+                    if response.status == 200:
+                        data = json.loads(response.read().decode())
+                        data["proto"] = proto
+                        return data
+            except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected, ConnectionResetError, ssl.SSLError):
+                pass
         if container_state(name) is not True:
             break
         time.sleep(1)
@@ -389,13 +400,20 @@ def deploy_standalone(image: str = "vault", force_build: bool = False):
     else:
         print(f"Usando master key existente: {key}")
 
+    tls_dir = folder / "tls"
+    tls_args = []
+    if tls_dir.is_dir() and (tls_dir / "server.crt").is_file():
+        tls_args = ["--mount", f"type=bind,source={tls_dir},target=/run/secrets/tls,readonly"]
+
     print("Iniciando API...")
     run("run", "-d", "--name", name, "-p", f"{port}:8000",
         "--mount", f"type=bind,source={key},target=/run/secrets/master.key,readonly",
+        *tls_args,
         "-v", f"{volume}:/var/lib/postgresql/data", image, capture=True)
 
     health = wait_for_api(name, port)
-    print(f"\n[SUCESSO] Vault no ar em http://localhost:{port}/docs | Role: {health.get('role', 'primary')}")
+    proto = health.get("proto", "http")
+    print(f"\n[SUCESSO] Vault no ar em {proto}://localhost:{port}/docs | Role: {health.get('role', 'primary')}")
 
 
 def deploy_cluster(image: str = "vault", force_build: bool = False):
@@ -450,15 +468,22 @@ def deploy_cluster(image: str = "vault", force_build: bool = False):
         init_fresh_db(primary_vol, folder, key, admin_user, admin_ip, admin_password, image=image)
 
     # Inicia Primário
+    tls_dir = folder / "tls"
+    tls_args = []
+    if tls_dir.is_dir() and (tls_dir / "server.crt").is_file():
+        tls_args = ["--mount", f"type=bind,source={tls_dir},target=/run/secrets/tls,readonly"]
+
     print(f"\nIniciando nó Primário ({primary_name})...")
     run("run", "-d", "--name", primary_name, "--network", net_name,
         "-p", f"{primary_port}:8000",
         "-e", "REPLICATION_ROLE=primary",
         "--mount", f"type=bind,source={key},target=/run/secrets/master.key,readonly",
+        *tls_args,
         "-v", f"{primary_vol}:/var/lib/postgresql/data", image, capture=True)
 
     health_p = wait_for_api(primary_name, primary_port)
-    print(f"Nó Primário pronto! Role: {health_p.get('role')} (http://localhost:{primary_port}/docs)")
+    proto_p = health_p.get("proto", "http")
+    print(f"Nó Primário pronto! Role: {health_p.get('role')} ({proto_p}://localhost:{primary_port}/docs)")
 
     # Inicia DR (Standby)
     print(f"\nIniciando nó DR ({dr_name})...")
@@ -467,16 +492,18 @@ def deploy_cluster(image: str = "vault", force_build: bool = False):
         "-e", "REPLICATION_ROLE=standby",
         "-e", f"PRIMARY_HOST={primary_name}",
         "--mount", f"type=bind,source={key},target=/run/secrets/master.key,readonly",
+        *tls_args,
         "-v", f"{dr_vol}:/var/lib/postgresql/data", image, capture=True)
 
     health_dr = wait_for_api(dr_name, dr_port)
-    print(f"Nó DR pronto! Role: {health_dr.get('role')} (http://localhost:{dr_port}/docs)")
+    proto_dr = health_dr.get("proto", "http")
+    print(f"Nó DR pronto! Role: {health_dr.get('role')} ({proto_dr}://localhost:{dr_port}/docs)")
 
     print("\n=======================================================")
     print("           CLUSTER DE ALTA DISPONIBILIDADE ATIVO       ")
     print("=======================================================")
-    print(f"• Primário: http://localhost:{primary_port}/docs (Escrita & Leitura)")
-    print(f"• Standby:  http://localhost:{dr_port}/docs (Somente Leitura - DR)")
+    print(f"• Primário: {proto_p}://localhost:{primary_port}/docs (Escrita & Leitura)")
+    print(f"• Standby:  {proto_dr}://localhost:{dr_port}/docs (Somente Leitura - DR)")
     print("\nCOMO REALIZAR FAILOVER MANUAL:")
     print(f"1. De fora do container: python deploy.py --promote {dr_name}")
     print(f"2. De dentro do container: docker exec -it {dr_name} vault-promote")
@@ -495,12 +522,27 @@ def init_fresh_db(volume, folder, key, admin_user, admin_ip, admin_password, ima
             raise AlreadyInitializedError(
                 f"O volume '{volume}' já contém um Vault inicializado, mas não há master.key em '{folder}'."
             )
-        run("exec", "-i", setup_name, "vault-init", "init", "--output-dir", "/tmp/vault-init-output",
+        run("exec", "-i", setup_name, "vaultctl", "init", "--output-dir", "/tmp/vault-init-output",
             "--admin-name", admin_user, "--admin-ip", admin_ip, "--admin-secret-stdin",
             input_text=admin_password + "\n")
         run("cp", f"{setup_name}:/tmp/vault-init-output/master.key", str(key))
         if not key.is_file():
             raise RuntimeError("Master key não chegou à pasta escolhida")
+
+        # Copia TLS se gerado pela PKI interna
+        has_tls = subprocess.run(
+            ["docker", "exec", setup_name, "test", "-d", "/tmp/vault-init-output/tls"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if has_tls:
+            tls_dest = folder / "tls"
+            tls_dest.mkdir(parents=True, exist_ok=True)
+            run("cp", f"{setup_name}:/tmp/vault-init-output/tls/.", str(tls_dest))
+            if os.name != "nt":
+                for f in tls_dest.glob("*"):
+                    if f.name.endswith(".key"):
+                        f.chmod(0o600)
+
         if os.name != "nt":
             key.chmod(0o600)
             sudo_uid = os.environ.get("SUDO_UID")
