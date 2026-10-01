@@ -148,12 +148,21 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
     # 3. Inicializa PostgreSQL caso o diretorio de dados esteja virgem
     pgdata.mkdir(parents=True, exist_ok=True)
     if not (pgdata / "PG_VERSION").is_file():
-        subprocess.run(["gosu", "postgres", "initdb", "-D", str(pgdata)], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(
+            ["gosu", "postgres", "initdb", "-D", str(pgdata), "-A", "trust", "--auth-local=trust"],
+            check=True, stdout=subprocess.DEVNULL
+        )
         db_pass = crypto.b64encode(crypto.generate_key())
         (pgdata / ".db_password").write_text(db_pass, encoding="utf-8")
         if os.name != "nt":
             (pgdata / ".db_password").chmod(0o600)
-            os.chown(str(pgdata / ".db_password"), 0, 0)
+            import pwd
+            try:
+                pg_uid = pwd.getpwnam("postgres").pw_uid
+                pg_gid = pwd.getpwnam("postgres").pw_gid
+                os.chown(str(pgdata / ".db_password"), pg_uid, pg_gid)
+            except Exception:
+                pass
 
     # 4. Decifra chaves para tmpfs temporario para subir o Postgres
     tmpfs_dir = pki.install_keys_to_tmpfs(tls_dir, master_key)
@@ -161,6 +170,9 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
     # 5. Inicia Postgres local temporariamente para criar o schema
     pg_opts = f"-c listen_addresses='localhost' -c ssl=on -c ssl_cert_file={tmpfs_dir}/server.crt -c ssl_key_file={tmpfs_dir}/server.key -c ssl_ca_file={tmpfs_dir}/ca.crt"
     subprocess.run(["gosu", "postgres", "pg_ctl", "-D", str(pgdata), "-o", pg_opts, "-w", "start"], check=True)
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
     try:
         # Cria usuario e banco se nao existirem
@@ -187,8 +199,10 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
         os.environ["DATABASE_URL"] = db_url
         (pgdata / ".database_url").write_text(db_url, encoding="utf-8")
 
-        Base.metadata.create_all(bind=engine)
-        db = SessionLocal()
+        temp_engine = create_engine(db_url, pool_pre_ping=True)
+        Base.metadata.create_all(bind=temp_engine)
+        TempSession = sessionmaker(bind=temp_engine)
+        db = TempSession()
         try:
             # Master key verification blob
             v_blob = crypto.encrypt(master_key, config.VERIFICATION_PLAINTEXT)
@@ -212,6 +226,7 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
             db.commit()
         finally:
             db.close()
+            temp_engine.dispose()
     finally:
         subprocess.run(["gosu", "postgres", "pg_ctl", "-D", str(pgdata), "-m", "fast", "-w", "stop"], check=True)
         pki.shred_tmpfs_keys(str(tmpfs_dir))

@@ -57,17 +57,23 @@ def verify_master_key_and_load_jwt_key(master_key: bytes) -> bytes:
         raise BootstrapError("VLT-1003", f"falha ao conectar no Postgres: {e}")
 
     try:
-        verification_row = db.query(VaultConfig).filter(
-            VaultConfig.key == config.VERIFICATION_CONFIG_KEY
-        ).first()
-        jwt_key_row = db.query(VaultConfig).filter(
-            VaultConfig.key == config.JWT_SIGNING_KEY_CONFIG_KEY
-        ).first()
+        try:
+            verification_row = db.query(VaultConfig).filter(
+                VaultConfig.key == config.VERIFICATION_CONFIG_KEY
+            ).first()
+            jwt_key_row = db.query(VaultConfig).filter(
+                VaultConfig.key == config.JWT_SIGNING_KEY_CONFIG_KEY
+            ).first()
+        except Exception as e:
+            raise BootstrapError(
+                "VLT-1005",
+                f"vault nao inicializado ou tabelas ausentes: execute 'vaultctl configure primary' antes do start ({e})",
+            )
 
         if not verification_row or not jwt_key_row:
             raise BootstrapError(
                 "VLT-1005",
-                "vault nao inicializado: rode 'vault-init init' antes do primeiro start.",
+                "vault nao inicializado: execute 'vaultctl configure primary' antes do primeiro start.",
             )
 
         try:
@@ -75,7 +81,7 @@ def verify_master_key_and_load_jwt_key(master_key: bytes) -> bytes:
         except Exception:
             raise BootstrapError(
                 "VLT-1004",
-                "master key fornecida nao confere com a usada no 'vault-init'. "
+                "master key fornecida nao confere com a gravada no setup. "
                 "Arquivo de master key errado montado neste container?",
             )
 

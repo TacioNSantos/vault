@@ -20,27 +20,47 @@ trap cleanup_tls EXIT TERM INT
 # =========================================================================
 # 1. ESTADO: UNCONFIGURED vs CONFIGURED
 # =========================================================================
-# Se o volume nao possui cluster.json nem PG_VERSION, o container entra
-# em modo de espera aguardando os comandos da CLI ('vaultctl configure ...').
-if [ ! -f "$PGDATA/cluster.json" ] && [ ! -s "$PGDATA/PG_VERSION" ]; then
-    echo "========================================================================"
-    echo " [VAULT] Appliance iniciado em estado NAO CONFIGURADO."
-    echo " Aguardando provisionamento via CLI..."
-    echo ""
-    echo " Para configurar como Líder (Primário):"
-    echo "   docker exec -it <container> vaultctl configure primary --hostname <fqdn> --admin-ip <cidr>"
-    echo ""
-    echo " Para configurar como Réplica (Standby):"
-    echo "   docker exec -i <container> vaultctl unpack seed - < seed.tar"
-    echo "   docker exec <container> vaultctl configure standby"
-    echo "========================================================================"
+mkdir -p "$PGDATA"
+if [ "$(id -u)" = "0" ]; then
+    chown -R postgres:postgres "$PGDATA" 2>/dev/null || true
+    chmod 700 "$PGDATA" 2>/dev/null || true
+fi
 
-    # Mantem o processo vivo aguardando a CLI criar cluster.json
-    while [ ! -f "$PGDATA/cluster.json" ] && [ ! -s "$PGDATA/PG_VERSION" ]; do
-        sleep 1
-    done
+# Se o volume nao possui cluster.json, o container entra em modo de espera
+# aguardando os comandos da CLI ('vaultctl configure ...').
+if [ ! -f "$PGDATA/cluster.json" ]; then
+    # Compatibilidade retroativa apenas se o volume legado ja possuia banco completo E tls
+    if [ -s "$PGDATA/PG_VERSION" ] && [ -f "$PGDATA/tls/cluster.crt" ]; then
+        echo "[VAULT] Volume pre-existente detectado. Gerando cluster.json..."
+        cat <<EOF > "$PGDATA/cluster.json"
+{
+  "role": "${REPLICATION_ROLE:-primary}",
+  "hostname": "localhost",
+  "primary_host": "${PRIMARY_HOST:-vault-primary}",
+  "primary_port": ${PRIMARY_PORT:-5432},
+  "configured_at": "legacy"
+}
+EOF
+    else
+        echo "========================================================================"
+        echo " [VAULT] Appliance iniciado em estado NAO CONFIGURADO."
+        echo " Aguardando provisionamento via CLI..."
+        echo ""
+        echo " Para configurar como Líder (Primário):"
+        echo "   docker exec -it <container> vaultctl configure primary --hostname <fqdn> --admin-ip <cidr>"
+        echo ""
+        echo " Para configurar como Réplica (Standby):"
+        echo "   docker exec -i <container> vaultctl unpack seed - < seed.tar"
+        echo "   docker exec <container> vaultctl configure standby"
+        echo "========================================================================"
 
-    echo "[VAULT] Configuracao detectada. Prosseguindo com o boot..."
+        # Mantem o processo vivo aguardando a CLI criar cluster.json
+        while [ ! -f "$PGDATA/cluster.json" ]; do
+            sleep 1
+        done
+
+        echo "[VAULT] Configuracao detectada. Prosseguindo com o boot..."
+    fi
 fi
 
 # =========================================================================
