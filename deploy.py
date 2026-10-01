@@ -42,6 +42,29 @@ def ask(label, default=None):
     return answer or default
 
 
+def is_port_free(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('0.0.0.0', port))
+            return True
+        except OSError:
+            return False
+
+
+def ask_port(label: str, default: int) -> int:
+    while True:
+        port_text = ask(label, str(default))
+        if not port_text.isdecimal() or not 1 <= int(port_text) <= 65535:
+            print("A porta deve ser um número entre 1 e 65535.")
+            continue
+        port = int(port_text)
+        if not is_port_free(port):
+            print(f"Atenção: A porta {port} já está em uso na máquina host! Escolha outra porta.")
+            continue
+        return port
+
+
 def container_state(name):
     result = subprocess.run(
         ["docker", "container", "inspect", "-f", "{{.State.Running}}", name],
@@ -332,10 +355,7 @@ def deploy_standalone(image: str = "vault", force_build: bool = False):
         return
 
     volume = ask("Volume Docker para o banco", "vault-data")
-    port_text = ask("Porta local da API", "8000")
-    if not port_text.isdecimal() or not 1 <= int(port_text) <= 65535:
-        raise ValueError("A porta deve ser um número entre 1 e 65535")
-    port = int(port_text)
+    port = ask_port("Porta local da API", 8000)
 
     folder = Path(ask("Pasta para master.key", str(ROOT / "vault-init-output"))).expanduser().resolve()
     key = folder / "master.key"
@@ -403,6 +423,16 @@ def deploy_cluster(image: str = "vault", force_build: bool = False):
             raise ValueError("As senhas não coincidem")
 
     ensure_image(image, force_build=force_build)
+
+    # Limpa containers anteriores com o mesmo nome se existirem parados ou em conflito
+    for c_name in (primary_name, dr_name):
+        c_state = container_state(c_name)
+        if c_state is not None:
+            if c_state is True:
+                print(f"Container '{c_name}' já está em execução. Verifique com: docker logs {c_name}")
+                return
+            print(f"Removendo container anterior parado '{c_name}'...")
+            run("rm", "-f", c_name, capture=True)
 
     # Cria rede e volumes
     networks = run("network", "ls", "--format", "{{.Name}}", capture=True).splitlines()
