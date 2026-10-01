@@ -35,9 +35,8 @@ Possui arquitetura de criptografia de envelope (Envelope Encryption), banco de d
    - [vaultctl certs inspect](#vaultctl-certs-inspect)
    - [vaultctl rescue](#vaultctl-rescue)
 6. [Fluxo de Deploy Multi-Máquina (Passo a Passo)](#6-fluxo-de-deploy-multi-máquina-passo-a-passo)
-   - [Passo 1: Inicializar o Nó 1 (Líder / Primário)](#passo-1-inicializar-o-nó-1-líder--primário)
-   - [Passo 2: Gerar Seed e Enviar ao Nó 2 (Standby)](#passo-2-gerar-seed-e-enviar-ao-nó-2-standby)
-   - [Passo 3: Desempacotar e Conectar o Nó 2](#passo-3-desempacotar-e-conectar-o-nó-2)
+   - [Cenário 1: Com PKI Interna (Certificados Autoassinados)](#cenário-1-com-pki-interna-certificados-autoassinados)
+   - [Cenário 2: Com Certificados Próprios (BYO-Cert — PKI Corporativa)](#cenário-2-com-certificados-próprios-byo-cert--pki-corporativa)
 7. [Failover Manual com Trava Anti-Split-Brain](#7-failover-manual-com-trava-anti-split-brain)
 8. [Resgate de Emergência Offline (Break-Glass)](#8-resgate-de-emergência-offline-break-glass)
 9. [Referência Completa da API REST](#9-referência-completa-da-api-rest)
@@ -248,9 +247,15 @@ Demonstração prática de implantação em duas máquinas separadas (Líder em 
                                                            4. mTLS WAL Streaming Ativo!
 ```
 
-### Passo 1: Inicializar o Nó 1 (Líder / Primário)
+---
 
-1. Crie a `master.key` (ou utilize uma chave de 32 bytes em base64):
+### Cenário 1: Com PKI Interna (Certificados Autoassinados)
+
+O Vault cria automaticamente a sua própria Root CA de 4096 bits e emite o certificado do cluster com os SANs fornecidos.
+
+#### Passo 1: Inicializar o Nó 1 (Líder / Primário)
+
+1. Crie a `master.key` (chave aleatória de 32 bytes em base64):
    ```bash
    mkdir -p ./secrets
    python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())" > ./secrets/master.key
@@ -276,34 +281,167 @@ Demonstração prática de implantação em duas máquinas separadas (Líder em 
        --admin-ip 10.10.20.0/24
    ```
 
-### Passo 2: Gerar Seed e Enviar ao Nó 2 (Standby)
+#### Passo 2: Gerar Seed e Enviar ao Nó 2 (Standby)
 
-Na máquina 2, inicie o container com a **mesma master key** (entregue por canal seguro):
-```bash
-# Na Máquina 2:
-docker run -d --name vault \
-    -p 443:443 \
-    -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
-    -v vault-data:/var/lib/postgresql/data \
-    vault:latest
-```
+1. Na Máquina 2, inicie o container com a **mesma master key** (entregue por canal seguro):
+   ```bash
+   # Na Máquina 2:
+   docker run -d --name vault \
+       -p 443:443 \
+       -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
+       -v vault-data:/var/lib/postgresql/data \
+       vault:latest
+   ```
 
-Na Máquina 1, gere o seed e envie via pipe SSH diretamente para o container do Nó 2:
-```bash
-# Na Máquina 1:
-docker exec vault vaultctl seed standby 10.10.20.20 --primary-host 10.10.20.10 | \
-    ssh usuario@10.10.20.20 "docker exec -i vault vaultctl unpack seed -"
-```
+2. Na Máquina 1, gere o seed e envie via pipe SSH diretamente para o container do Nó 2:
+   ```bash
+   # Na Máquina 1:
+   docker exec vault vaultctl seed standby 10.10.20.20 --primary-host 10.10.20.10 | \
+       ssh usuario@10.10.20.20 "docker exec -i vault vaultctl unpack seed -"
+   ```
 
-### Passo 3: Desempacotar e Conectar o Nó 2
+#### Passo 3: Desempacotar e Conectar o Nó 2
 
 Na Máquina 2, execute a configuração do Standby (nenhuma flag necessária; todos os parâmetros e certificados mTLS são herdados do seed):
 ```bash
 # Na Máquina 2:
 docker exec vault vaultctl configure standby
 ```
+*O nó 2 executará o `pg_basebackup` via mTLS com o nó 1 e passará a receber o streaming de WAL em tempo real.*
 
-Pronto! O nó 2 executará o `pg_basebackup` via mTLS com o nó 1 e passará a receber o streaming de WAL em tempo real.
+---
+
+### Cenário 2: Com Certificados Próprios (BYO-Cert — PKI Corporativa)
+
+Se a sua organização já possui certificados emitidos por uma autoridade corporativa (Microsoft AD CS, DigiCert, Venafi, Let's Encrypt, etc.):
+
+#### 1. Requisitos do Certificado Corporativo
+* **Formato:** PEM em texto plano (ASCII com delimitadores `-----BEGIN CERTIFICATE-----` e `-----BEGIN RSA PRIVATE KEY-----` ou `PRIVATE KEY`).
+* **Chave Privada:** Chave RSA sem senha (ela será cifrada em AES-256-GCM com a `master.key` pelo Vault ao ser importada).
+* **ExtendedKeyUsage (EKU):** Deve conter obrigatoriamente:
+  - `Server Authentication` (`serverAuth`, OID `1.3.6.1.5.5.7.3.1`)
+  - `Client Authentication` (`clientAuth`, OID `1.3.6.1.5.5.7.3.2`) — *exigido para o mTLS da replicação.*
+* **SANs (Subject Alternative Names):** Deve cobrir obrigatoriamente:
+  - O FQDN ou hostname principal do cluster (ex.: `vault.empresa.com.br`)
+  - O hostname ou IP da máquina Primária (ex.: `vault1.empresa.com.br`, `10.10.20.10`)
+  - O hostname ou IP de **todas as máquinas Standby** (ex.: `vault2.empresa.com.br`, `10.10.20.20`)
+  - `localhost` e `127.0.0.1`
+
+---
+
+#### 2. Estrutura de Pastas e Arquivos no Líder
+Crie uma pasta dedicada para os certificados na máquina do Líder (ex.: `./certs`):
+```text
+/home/usuario/Vault/
+├── certs/
+│   ├── cluster.crt     # Certificado do cluster emitido pela sua PKI
+│   ├── cluster.key     # Chave privada correspondente
+│   └── ca.crt          # Root CA (ou cadeia de CAs intermediárias)
+└── secrets/
+    └── master.key      # Chave mestra do Vault (32 bytes em base64)
+```
+
+---
+
+#### 3. Iniciar o Container do Líder montando os Certificados
+Inicie o container montando a pasta de certificados no volume com `:ro`:
+```bash
+docker run -d --name vault \
+    -p 443:443 \
+    -p 5432:5432 \
+    -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
+    -v $(pwd)/certs:/certs:ro \
+    -v vault-data:/var/lib/postgresql/data \
+    vault:latest
+```
+
+---
+
+#### 4. Inicializar o Líder com as flags `--cert`, `--key` e `--ca`
+Execute o `vaultctl configure primary` apontando os caminhos dos certificados montados:
+```bash
+docker exec -it vault vaultctl configure primary \
+    --hostname vault.empresa.com.br \
+    --altname vault1.empresa.com.br \
+    --altname vault2.empresa.com.br \
+    --altname 10.10.20.10 \
+    --altname 10.10.20.20 \
+    --admin-ip 10.10.20.0/24 \
+    --cert /certs/cluster.crt \
+    --key /certs/cluster.key \
+    --ca /certs/ca.crt
+```
+
+**Validações automáticas de segurança executadas pelo `vaultctl`:**
+1. Confirma se os PEMs são válidos e decodificáveis.
+2. Compara a chave privada com a chave pública do certificado (rejeita se não baterem).
+3. Valida se a cadeia do certificado confere criptograficamente com a CA fornecida.
+4. Checa se o `--hostname` e todos os `--altname` estão presentes nos SANs do certificado.
+5. Valida se possui EKU para `serverAuth` e `clientAuth`.
+6. Verifica a data de validade (rejeita se expirado e avisa no terminal se restar menos de 30 dias).
+7. Cifra a chave privada com a `master.key` em repouso (`cluster.key.enc`).
+
+---
+
+#### 5. Como o Nó Standby herda o Certificado Corporativo
+Você **não precisa** copiar a pasta `certs/` para a segunda máquina!
+O comando de seed empacota o certificado do cluster e a chave privada cifrada automaticamente:
+
+```bash
+# 1. Na Máquina 2: Inicie o container com a master.key montada
+docker run -d --name vault \
+    -p 443:443 \
+    -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
+    -v vault-data:/var/lib/postgresql/data \
+    vault:latest
+
+# 2. Na Máquina 1: Gere o seed corporativo e envie via pipe SSH para a Máquina 2
+docker exec vault vaultctl seed standby 10.10.20.20 --primary-host 10.10.20.10 | \
+    ssh usuario@10.10.20.20 "docker exec -i vault vaultctl unpack seed -"
+
+# 3. Na Máquina 2: Configure o Standby (herda certificados corporativos automaticamente)
+docker exec vault vaultctl configure standby
+```
+
+---
+
+#### 6. (Referência) Como gerar a CSR corporativa com OpenSSL
+Se você precisar solicitar o certificado para a equipe de segurança da sua empresa:
+
+1. Crie o arquivo `vault-csr.cnf`:
+```ini
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+req_extensions = req_ext
+distinguished_name = dn
+
+[dn]
+CN = vault.empresa.com.br
+O = Minha Empresa
+OU = Seguranca
+
+[req_ext]
+subjectAltName = @alt_names
+extendedKeyUsage = serverAuth, clientAuth
+keyUsage = digitalSignature, keyEncipherment
+
+[alt_names]
+DNS.1 = vault.empresa.com.br
+DNS.2 = vault1.empresa.com.br
+DNS.3 = vault2.empresa.com.br
+DNS.4 = localhost
+IP.1 = 10.10.20.10
+IP.2 = 10.10.20.20
+IP.3 = 127.0.0.1
+```
+
+2. Gere a chave privada e a requisição (CSR):
+```bash
+openssl req -new -nodes -out cluster.csr -newkey rsa:2048 -keyout cluster.key -config vault-csr.cnf
+```
+3. Envie o `cluster.csr` para a sua PKI corporativa assinar e utilize os certificados resultantes no Passo 3 e 4.
 
 ---
 
