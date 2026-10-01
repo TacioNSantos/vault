@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+SQLAlchemy==2.0.35
+psycopg2-binary==2.9.9
+python-jose[cryptography]==3.3.0
+cryptography==43.0.1
+bcrypt==4.2.0
+click==8.1.7
+pydantic==2.9.2
