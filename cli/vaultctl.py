@@ -192,14 +192,15 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
             ["gosu", "postgres", "psql", "-c", f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vault') THEN CREATE USER vault WITH NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{pass_val}'; END IF; END $$;"],
             check=True, stdout=subprocess.DEVNULL
         )
-        subprocess.run(
-            ["gosu", "postgres", "psql", "-c", "SELECT 1 FROM pg_database WHERE datname = 'vault'"],
-            capture_output=True, check=True
+        check_db = subprocess.run(
+            ["gosu", "postgres", "psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = 'vault';"],
+            capture_output=True, text=True
         )
-        subprocess.run(
-            ["gosu", "postgres", "psql", "-c", "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'vault') THEN CREATE DATABASE vault OWNER vault; END IF; END $$;"],
-            check=True, stdout=subprocess.DEVNULL
-        )
+        if "1" not in (check_db.stdout or ""):
+            subprocess.run(
+                ["gosu", "postgres", "psql", "-c", "CREATE DATABASE vault OWNER vault;"],
+                check=True, stdout=subprocess.DEVNULL
+            )
         subprocess.run(
             ["gosu", "postgres", "psql", "-d", "vault", "-c", "GRANT ALL ON SCHEMA public TO vault;"],
             check=True, stdout=subprocess.DEVNULL
