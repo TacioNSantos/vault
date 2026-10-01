@@ -57,22 +57,43 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
             -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U "$REPLICATION_USER" \
             -D "$PGDATA" -Fp -Xs -R
         echo "pg_basebackup concluido com sucesso. Configurando standby..."
+        if [ -f "$DB_PASS_FILE" ]; then
+            PASS="$(cat "$DB_PASS_FILE")"
+            export POSTGRES_PASSWORD="$PASS"
+            export DATABASE_URL="postgresql+psycopg2://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:5432/$POSTGRES_DB"
+            echo "$DATABASE_URL" > "$PGDATA/.database_url" 2>/dev/null || true
+            chmod 600 "$PGDATA/.database_url" 2>/dev/null || true
+            chown postgres:postgres "$PGDATA/.database_url" 2>/dev/null || true
+        fi
     else
         echo "Inicializando cluster Postgres pela primeira vez..."
         mkdir -p "$PGDATA"
         chown -R postgres:postgres "$PGDATA"
+        chmod 700 "$PGDATA"
         gosu postgres initdb -D "$PGDATA" > /dev/null
 
         echo "$POSTGRES_PASSWORD" > "$DB_PASS_FILE"
         chmod 600 "$DB_PASS_FILE"
         chown postgres:postgres "$DB_PASS_FILE"
 
+        echo "$DATABASE_URL" > "$PGDATA/.database_url"
+        chmod 600 "$PGDATA/.database_url"
+        chown postgres:postgres "$PGDATA/.database_url"
+
         gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
         # Cria usuario da aplicacao sem privilégios de SUPERUSER (Principio do Menor Privilegio)
         gosu postgres psql --command "CREATE USER $POSTGRES_USER WITH NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$POSTGRES_PASSWORD';"
         gosu postgres psql --command "CREATE DATABASE $POSTGRES_DB OWNER $POSTGRES_USER;"
+        gosu postgres psql -d "$POSTGRES_DB" --command "GRANT ALL ON SCHEMA public TO $POSTGRES_USER;"
         gosu postgres pg_ctl -D "$PGDATA" -m fast -w stop
     fi
+fi
+
+# Assegura que .database_url existe no volume compartilhado
+if [ -d "$PGDATA" ]; then
+    echo "$DATABASE_URL" > "$PGDATA/.database_url" 2>/dev/null || true
+    chmod 600 "$PGDATA/.database_url" 2>/dev/null || true
+    chown postgres:postgres "$PGDATA/.database_url" 2>/dev/null || true
 fi
 
 chown -R postgres:postgres "$PGDATA"

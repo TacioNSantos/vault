@@ -68,14 +68,23 @@ def wait_for_postgres(name):
 
 def is_initialized(name):
     check = (
-        "from sqlalchemy import inspect; "
-        "from vault.database import engine, SessionLocal; "
-        "from vault.models import VaultConfig; "
-        "from vault import config; "
-        "exists = inspect(engine).has_table('vault_config'); "
-        "db = SessionLocal(); "
-        "print('yes' if exists and db.get(VaultConfig, config.VERIFICATION_CONFIG_KEY) else 'no'); "
-        "db.close()"
+        "import sys\n"
+        "try:\n"
+        "    from sqlalchemy import inspect\n"
+        "    from vault.database import engine, SessionLocal\n"
+        "    from vault.models import VaultConfig\n"
+        "    from vault import config\n"
+        "    exists = inspect(engine).has_table('vault_config')\n"
+        "    if exists:\n"
+        "        db = SessionLocal()\n"
+        "        has_key = db.get(VaultConfig, config.VERIFICATION_CONFIG_KEY) is not None\n"
+        "        db.close()\n"
+        "        print('yes' if has_key else 'no')\n"
+        "    else:\n"
+        "        print('no')\n"
+        "except Exception as e:\n"
+        "    sys.stderr.write(f'Erro checando status do banco: {e}\\n')\n"
+        "    sys.exit(1)\n"
     )
     return run("exec", name, "python", "-c", check, capture=True) == "yes"
 
@@ -451,6 +460,16 @@ def init_fresh_db(volume, folder, key, admin_user, admin_ip, admin_password, ima
             raise RuntimeError("Master key não chegou à pasta escolhida")
         if os.name != "nt":
             key.chmod(0o600)
+            sudo_uid = os.environ.get("SUDO_UID")
+            sudo_gid = os.environ.get("SUDO_GID")
+            if sudo_uid and sudo_gid:
+                try:
+                    uid = int(sudo_uid)
+                    gid = int(sudo_gid)
+                    os.chown(str(key), uid, gid)
+                    os.chown(str(folder), uid, gid)
+                except Exception:
+                    pass
     finally:
         run("stop", setup_name, capture=True)
         run("rm", setup_name, capture=True)
@@ -487,7 +506,15 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, subprocess.CalledProcessError, RuntimeError, ValueError) as error:
+    except subprocess.CalledProcessError as error:
+        cmd_str = " ".join(error.cmd) if isinstance(error.cmd, list) else str(error.cmd)
+        print(f"\nErro ao executar comando: {cmd_str}", file=sys.stderr)
+        if error.stderr:
+            print(f"Stderr: {error.stderr.strip()}", file=sys.stderr)
+        if error.stdout:
+            print(f"Stdout: {error.stdout.strip()}", file=sys.stderr)
+        sys.exit(error.returncode or 1)
+    except (OSError, RuntimeError, ValueError) as error:
         print(f"\nErro: {error}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

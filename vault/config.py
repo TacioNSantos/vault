@@ -7,11 +7,44 @@ import os
 # Se nao existir nesse path no boot, o container NAO sobe (ver bootstrap.py).
 MASTER_KEY_FILE = os.environ.get("MASTER_KEY_FILE", "/run/secrets/master.key")
 
+
+def _get_database_url() -> str:
+    # 1. Respeita env var explicita
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        return url
+
+    # 2. Tenta ler URL gravada pelo entrypoint no volume compartilhado
+    pgdata = os.environ.get("PGDATA", "/var/lib/postgresql/data")
+    db_url_file = os.path.join(pgdata, ".database_url")
+    if os.path.isfile(db_url_file):
+        try:
+            with open(db_url_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return content
+        except Exception:
+            pass
+
+    # 3. Tenta ler a credencial segura salva no volume do Postgres
+    pw_file = os.path.join(pgdata, ".db_password")
+    user = os.environ.get("POSTGRES_USER", "vault")
+    db = os.environ.get("POSTGRES_DB", "vault")
+    password = "vault"
+    if os.path.isfile(pw_file):
+        try:
+            with open(pw_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    password = content
+        except Exception:
+            pass
+
+    return f"postgresql+psycopg2://{user}:{password}@localhost:5432/{db}"
+
+
 # Postgres roda dentro do mesmo container (all-in-one appliance).
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+psycopg2://vault:vault@localhost:5432/vault",
-)
+DATABASE_URL = _get_database_url()
 
 # Duracao padrao do JWT emitido para App IDs.
 JWT_TTL_MINUTES = int(os.environ.get("JWT_TTL_MINUTES", "15"))

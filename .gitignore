@@ -31,4 +31,6 @@ admin-credentials.txt
 
 # Local runtime & database artifacts
 *.log
+*.tar
+*.tar.gz
 pgdata/
