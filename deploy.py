@@ -115,10 +115,37 @@ def find_running_container_with_volume(volume_name: str) -> str | None:
     return None
 
 
+def image_exists(image_name: str) -> bool:
+    result = subprocess.run(
+        ["docker", "image", "inspect", image_name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    return result.returncode == 0
+
+
+def ensure_image(image_name: str, force_build: bool = False):
+    if not force_build and image_exists(image_name):
+        print(f"Imagem Docker '{image_name}' encontrada. Pulando build.")
+        return
+
+    dockerfile_path = ROOT / "Dockerfile"
+    if dockerfile_path.is_file():
+        action = "Reconstruindo" if force_build else "Construindo"
+        print(f"\n{action} imagem Docker '{image_name}' a partir do Dockerfile local...")
+        run("build", "-t", image_name, ".")
+        return
+
+    if force_build:
+        raise RuntimeError(f"Opção --build solicitada, mas Dockerfile não foi encontrado em: {dockerfile_path}")
+
+    print(f"\nImagem '{image_name}' não encontrada localmente e Dockerfile ausente. Tentando pull...")
+    run("pull", image_name)
+
+
 # =========================================================================
 # 1. BREAK-GLASS: Resgate offline de segredos
 # =========================================================================
-def rescue_offline(key_path_str: str, volume_name: str, output_file: str | None = None):
+def rescue_offline(key_path_str: str, volume_name: str, output_file: str | None = None, image: str = "vault"):
     key_path = Path(key_path_str).expanduser().resolve()
     if not key_path.is_file():
         raise ValueError(f"Arquivo master.key não encontrado: {key_path}")
@@ -162,7 +189,7 @@ def rescue_offline(key_path_str: str, volume_name: str, output_file: str | None 
                 "--mount", f"type=bind,source={key_path},target=/run/secrets/master.key,readonly",
                 "--network", "none",
                 "--entrypoint", "bash",
-                "vault", "-c", rescue_cmd
+                image, "-c", rescue_cmd
             ],
             text=True,
             stdout=subprocess.PIPE,
@@ -259,19 +286,20 @@ def promote_standby(container_name: str, force: bool = False):
 # =========================================================================
 # 3. WIZARD INTERATIVO DE DEPLOY (NÓ ÚNICO OU CLUSTER COM DR)
 # =========================================================================
-def interactive_deploy():
+def interactive_deploy(image: str = "vault", force_build: bool = False):
     print(f"Vault Deploy | Sistema detectado: {platform.system()}")
     run("info", "--format", "{{.ServerVersion}}", capture=True)
 
+    image_name = ask("Imagem Docker do Vault", image)
     enable_dr = ask("Deseja configurar Cluster com Réplica de DR (Hot Standby)? (s/N)", "n").lower() == "s"
 
     if enable_dr:
-        deploy_cluster()
+        deploy_cluster(image=image_name, force_build=force_build)
     else:
-        deploy_standalone()
+        deploy_standalone(image=image_name, force_build=force_build)
 
 
-def deploy_standalone():
+def deploy_standalone(image: str = "vault", force_build: bool = False):
     name = ask("Nome do container", "vault")
     state = container_state(name)
     if state is True:
@@ -315,25 +343,24 @@ def deploy_standalone():
         if admin_password != getpass.getpass("Confirme a senha do admin: "):
             raise ValueError("As senhas não coincidem")
 
-    print("\nConstruindo imagem Docker...")
-    run("build", "-t", "vault", ".")
+    ensure_image(image, force_build=force_build)
     run("volume", "create", volume, capture=True)
 
     if fresh:
-        init_fresh_db(volume, folder, key, admin_user, admin_ip, admin_password)
+        init_fresh_db(volume, folder, key, admin_user, admin_ip, admin_password, image=image)
     else:
         print(f"Usando master key existente: {key}")
 
     print("Iniciando API...")
     run("run", "-d", "--name", name, "-p", f"{port}:8000",
         "--mount", f"type=bind,source={key},target=/run/secrets/master.key,readonly",
-        "-v", f"{volume}:/var/lib/postgresql/data", "vault", capture=True)
+        "-v", f"{volume}:/var/lib/postgresql/data", image, capture=True)
 
     health = wait_for_api(name, port)
     print(f"\n[SUCESSO] Vault no ar em http://localhost:{port}/docs | Role: {health.get('role', 'primary')}")
 
 
-def deploy_cluster():
+def deploy_cluster(image: str = "vault", force_build: bool = False):
     net_name = ask("Nome da rede Docker interna para o cluster", "vault-cluster-net")
     primary_name = ask("Nome do container Primário", "vault-primary")
     primary_port = int(ask("Porta da API do Primário", "8000"))
@@ -357,8 +384,7 @@ def deploy_cluster():
         if admin_password != getpass.getpass("Confirme a senha do admin: "):
             raise ValueError("As senhas não coincidem")
 
-    print("\nConstruindo imagem Docker...")
-    run("build", "-t", "vault", ".")
+    ensure_image(image, force_build=force_build)
 
     # Cria rede e volumes
     networks = run("network", "ls", "--format", "{{.Name}}", capture=True).splitlines()
@@ -369,7 +395,7 @@ def deploy_cluster():
     run("volume", "create", dr_vol, capture=True)
 
     if fresh:
-        init_fresh_db(primary_vol, folder, key, admin_user, admin_ip, admin_password)
+        init_fresh_db(primary_vol, folder, key, admin_user, admin_ip, admin_password, image=image)
 
     # Inicia Primário
     print(f"\nIniciando nó Primário ({primary_name})...")
@@ -377,7 +403,7 @@ def deploy_cluster():
         "-p", f"{primary_port}:8000",
         "-e", "REPLICATION_ROLE=primary",
         "--mount", f"type=bind,source={key},target=/run/secrets/master.key,readonly",
-        "-v", f"{primary_vol}:/var/lib/postgresql/data", "vault", capture=True)
+        "-v", f"{primary_vol}:/var/lib/postgresql/data", image, capture=True)
 
     health_p = wait_for_api(primary_name, primary_port)
     print(f"Nó Primário pronto! Role: {health_p.get('role')} (http://localhost:{primary_port}/docs)")
@@ -389,7 +415,7 @@ def deploy_cluster():
         "-e", "REPLICATION_ROLE=standby",
         "-e", f"PRIMARY_HOST={primary_name}",
         "--mount", f"type=bind,source={key},target=/run/secrets/master.key,readonly",
-        "-v", f"{dr_vol}:/var/lib/postgresql/data", "vault", capture=True)
+        "-v", f"{dr_vol}:/var/lib/postgresql/data", image, capture=True)
 
     health_dr = wait_for_api(dr_name, dr_port)
     print(f"Nó DR pronto! Role: {health_dr.get('role')} (http://localhost:{dr_port}/docs)")
@@ -405,12 +431,12 @@ def deploy_cluster():
     print("=======================================================\n")
 
 
-def init_fresh_db(volume, folder, key, admin_user, admin_ip, admin_password):
+def init_fresh_db(volume, folder, key, admin_user, admin_ip, admin_password, image: str = "vault"):
     folder.mkdir(parents=True, exist_ok=True)
     setup_name = f"vault-setup-{uuid.uuid4().hex[:8]}"
     print(f"Iniciando Postgres no container temporário {setup_name}...")
     run("run", "-d", "--name", setup_name, "-e", "VAULT_INIT_ONLY=1",
-        "-v", f"{volume}:/var/lib/postgresql/data", "vault", capture=True)
+        "-v", f"{volume}:/var/lib/postgresql/data", image, capture=True)
     try:
         wait_for_postgres(setup_name)
         if is_initialized(setup_name):
@@ -436,6 +462,8 @@ def init_fresh_db(volume, folder, key, admin_user, admin_ip, admin_password):
 # =========================================================================
 def main():
     parser = argparse.ArgumentParser(description="Vault Deploy & Cluster Manager")
+    parser.add_argument("--image", default="vault", help="Nome ou tag da imagem Docker do Vault (padrão: vault)")
+    parser.add_argument("--build", action="store_true", help="Força a reconstrução da imagem Docker mesmo se já existir localmente")
     parser.add_argument("--promote", nargs="?", const="vault-dr", help="Promove um no standby para primario (ex: --promote vault-dr)")
     parser.add_argument("--force", action="store_true", help="Ignora a trava anti-split-brain na promocao")
     parser.add_argument("--rescue", action="store_true", help="Executa extracao de emergencia offline (Break-Glass)")
@@ -451,9 +479,9 @@ def main():
         if not args.key or not args.volume:
             print("Erro: --rescue requer --key <caminho_master.key> e --volume <nome_volume>", file=sys.stderr)
             sys.exit(1)
-        rescue_offline(args.key, args.volume, args.output)
+        rescue_offline(args.key, args.volume, args.output, image=args.image)
     else:
-        interactive_deploy()
+        interactive_deploy(image=args.image, force_build=args.build)
 
 
 if __name__ == "__main__":

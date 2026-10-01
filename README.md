@@ -232,6 +232,32 @@ como `app_name` e a senha escolhida como `app_secret` em `POST /auth/token`.
 Guarde a `master.key` em local privado; sem ela não é possível abrir os secrets
 do banco. Não use `--force` no setup de um banco com secrets existentes.
 
+### Implantação com Imagem Pronta (Sem compilar no servidor)
+
+Você não precisa enviar o código-fonte para o servidor Linux de destino. É possível gerar a imagem em uma máquina e apenas exportá-la:
+
+1. **Na máquina de desenvolvimento (gera o tar da imagem):**
+   ```bash
+   docker build -t vault:latest .
+   docker save -o vault.tar vault:latest
+   ```
+
+2. **Copie apenas o `vault.tar` e o `deploy.py` para o servidor Linux:**
+   ```bash
+   scp vault.tar deploy.py usuario@ip-servidor:/home/usuario/
+   ```
+
+3. **No servidor Linux de destino:**
+   ```bash
+   docker load -i vault.tar
+   python3 deploy.py
+   ```
+   *O `deploy.py` detecta automaticamente que a imagem já existe no Docker local e pula a etapa de compilação/build, indo direto para a configuração do Vault.*
+
+   Também é possível especificar outra tag ou forçar build:
+   - `python3 deploy.py --image meu-registro.com/vault:1.0`
+   - `python3 deploy.py --build` (força a recompilação se o Dockerfile estiver presente)
+
 ### Comandos manuais
 
 ```bash
