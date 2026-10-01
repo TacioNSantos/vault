@@ -54,12 +54,17 @@ def container_state(name):
 
 def wait_for_postgres(name):
     for _ in range(60):
-        result = subprocess.run(
-            ["docker", "exec", name, "pg_isready", "-q", "-h", "localhost", "-U", "vault", "-d", "vault"],
+        ready = subprocess.run(
+            ["docker", "exec", name, "test", "-f", "/tmp/postgres-ready"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        if result.returncode == 0:
-            return
+        if ready.returncode == 0:
+            check_pg = subprocess.run(
+                ["docker", "exec", name, "pg_isready", "-q", "-h", "localhost", "-U", "vault", "-d", "vault"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if check_pg.returncode == 0:
+                return
         if container_state(name) is not True:
             break
         time.sleep(1)
@@ -68,23 +73,27 @@ def wait_for_postgres(name):
 
 def is_initialized(name):
     check = (
-        "import sys\n"
-        "try:\n"
-        "    from sqlalchemy import inspect\n"
-        "    from vault.database import engine, SessionLocal\n"
-        "    from vault.models import VaultConfig\n"
-        "    from vault import config\n"
-        "    exists = inspect(engine).has_table('vault_config')\n"
-        "    if exists:\n"
-        "        db = SessionLocal()\n"
-        "        has_key = db.get(VaultConfig, config.VERIFICATION_CONFIG_KEY) is not None\n"
-        "        db.close()\n"
-        "        print('yes' if has_key else 'no')\n"
-        "    else:\n"
-        "        print('no')\n"
-        "except Exception as e:\n"
-        "    sys.stderr.write(f'Erro checando status do banco: {e}\\n')\n"
-        "    sys.exit(1)\n"
+        "import sys, time\n"
+        "from sqlalchemy import inspect\n"
+        "from vault.database import engine, SessionLocal\n"
+        "from vault.models import VaultConfig\n"
+        "from vault import config\n"
+        "for attempt in range(5):\n"
+        "    try:\n"
+        "        exists = inspect(engine).has_table('vault_config')\n"
+        "        if exists:\n"
+        "            db = SessionLocal()\n"
+        "            has_key = db.get(VaultConfig, config.VERIFICATION_CONFIG_KEY) is not None\n"
+        "            db.close()\n"
+        "            print('yes' if has_key else 'no')\n"
+        "        else:\n"
+        "            print('no')\n"
+        "        sys.exit(0)\n"
+        "    except Exception as e:\n"
+        "        if attempt == 4:\n"
+        "            sys.stderr.write(f'Erro checando status do banco: {e}\\n')\n"
+        "            sys.exit(1)\n"
+        "        time.sleep(1)\n"
     )
     return run("exec", name, "python", "-c", check, capture=True) == "yes"
 

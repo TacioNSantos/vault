@@ -80,12 +80,11 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
         chmod 600 "$PGDATA/.database_url"
         chown postgres:postgres "$PGDATA/.database_url"
 
-        gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
+        gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='$POSTGRES_LISTEN_ADDRESSES'" -w start
         # Cria usuario da aplicacao sem privilégios de SUPERUSER (Principio do Menor Privilegio)
         gosu postgres psql --command "CREATE USER $POSTGRES_USER WITH NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$POSTGRES_PASSWORD';"
         gosu postgres psql --command "CREATE DATABASE $POSTGRES_DB OWNER $POSTGRES_USER;"
         gosu postgres psql -d "$POSTGRES_DB" --command "GRANT ALL ON SCHEMA public TO $POSTGRES_USER;"
-        gosu postgres pg_ctl -D "$PGDATA" -m fast -w stop
     fi
 fi
 
@@ -98,10 +97,12 @@ fi
 
 chown -R postgres:postgres "$PGDATA"
 chmod 700 "$PGDATA"
-if ! gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='$POSTGRES_LISTEN_ADDRESSES'" -w start; then
-    echo "Aviso: falha ao iniciar Postgres. Tentando auto-recuperacao de checkpoint..." >&2
-    gosu postgres pg_resetwal -f "$PGDATA"
-    gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='$POSTGRES_LISTEN_ADDRESSES'" -w start
+if ! gosu postgres pg_isready -q; then
+    if ! gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='$POSTGRES_LISTEN_ADDRESSES'" -w start; then
+        echo "Aviso: falha ao iniciar Postgres. Tentando auto-recuperacao de checkpoint..." >&2
+        gosu postgres pg_resetwal -f "$PGDATA"
+        gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='$POSTGRES_LISTEN_ADDRESSES'" -w start
+    fi
 fi
 
 until gosu postgres pg_isready -q; do
@@ -124,6 +125,7 @@ fi
 
 if [ "${VAULT_INIT_ONLY:-0}" = "1" ]; then
     echo "Postgres pronto para vault-init."
+    touch /tmp/postgres-ready
     exec sleep infinity
 fi
 
