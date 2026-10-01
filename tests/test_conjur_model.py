@@ -274,16 +274,21 @@ class TestConjurModelPKIAndCLI(unittest.TestCase):
         # Testa unpack via stdin '-' com master.key correta
         pgdata_standby = Path(self.tmp_dir) / "standby_data"
         pgdata_standby.mkdir(parents=True, exist_ok=True)
+        stage_dir = Path(self.tmp_dir) / "test_stage"
 
         res_unpack = self.runner.invoke(
             cli,
             ["unpack", "seed", "-"],
             input=seed_bytes,
-            env={"PGDATA": str(pgdata_standby), "MASTER_KEY_FILE": self.master_key_file},
+            env={
+                "PGDATA": str(pgdata_standby),
+                "MASTER_KEY_FILE": self.master_key_file,
+                "SEED_STAGE_DIR": str(stage_dir),
+            },
         )
         self.assertEqual(res_unpack.exit_code, 0, msg=res_unpack.output)
-        self.assertTrue((pgdata_standby / "seed_stage" / "cluster.crt").is_file())
-        self.assertTrue((pgdata_standby / "seed_stage" / "cluster.key.enc").is_file())
+        self.assertTrue((stage_dir / "cluster.crt").is_file())
+        self.assertTrue((stage_dir / "cluster.key.enc").is_file())
 
         # Testa unpack com master.key ERRADA
         wrong_master_key_file = Path(self.tmp_dir) / "wrong.key"
@@ -291,12 +296,17 @@ class TestConjurModelPKIAndCLI(unittest.TestCase):
 
         pgdata_standby_err = Path(self.tmp_dir) / "standby_err_data"
         pgdata_standby_err.mkdir(parents=True, exist_ok=True)
+        stage_dir_err = Path(self.tmp_dir) / "test_stage_err"
 
         res_err = self.runner.invoke(
             cli,
             ["unpack", "seed", "-"],
             input=seed_bytes,
-            env={"PGDATA": str(pgdata_standby_err), "MASTER_KEY_FILE": str(wrong_master_key_file)},
+            env={
+                "PGDATA": str(pgdata_standby_err),
+                "MASTER_KEY_FILE": str(wrong_master_key_file),
+                "SEED_STAGE_DIR": str(stage_dir_err),
+            },
         )
         self.assertNotEqual(res_err.exit_code, 0)
         self.assertIn("VLT-1004", res_err.output)

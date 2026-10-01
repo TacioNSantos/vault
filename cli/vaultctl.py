@@ -47,6 +47,10 @@ def get_master_key_file() -> Path:
     return Path(os.environ.get("MASTER_KEY_FILE", config.MASTER_KEY_FILE)).expanduser().resolve()
 
 
+def get_seed_stage_dir() -> Path:
+    return Path(os.environ.get("SEED_STAGE_DIR", "/tmp/vault_seed_stage")).expanduser().resolve()
+
+
 def load_master_key() -> bytes:
     key_path = get_master_key_file()
     if not key_path.is_file():
@@ -139,15 +143,16 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
         )
         ca_type = "internal"
 
-    # 2. Salva PKI no volume com chaves privadas cifradas
-    tls_dir = pgdata / "tls"
-    pki.save_cluster_pki_to_disk(
-        tls_dir, master_key, ca_cert, cluster_cert, cluster_key, ca_key
-    )
-
-    # 3. Inicializa PostgreSQL caso o diretorio de dados esteja virgem
+    # 2. Inicializa PostgreSQL PRIMEIRO (se o banco for novo)
     pgdata.mkdir(parents=True, exist_ok=True)
     if not (pgdata / "PG_VERSION").is_file():
+        # Limpa residuos de tentativas anteriores para o initdb nao falhar com "directory exists but is not empty"
+        for item in pgdata.iterdir():
+            if item.is_dir():
+                shutil.rmtree(str(item), ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+
         subprocess.run(
             ["gosu", "postgres", "initdb", "-D", str(pgdata), "-A", "trust", "--auth-local=trust"],
             check=True, stdout=subprocess.DEVNULL
@@ -163,6 +168,12 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
                 os.chown(str(pgdata / ".db_password"), pg_uid, pg_gid)
             except Exception:
                 pass
+
+    # 3. Salva PKI no volume com chaves privadas cifradas (agora seguro apos o initdb)
+    tls_dir = pgdata / "tls"
+    pki.save_cluster_pki_to_disk(
+        tls_dir, master_key, ca_cert, cluster_cert, cluster_key, ca_key
+    )
 
     # 4. Decifra chaves para tmpfs temporario para subir o Postgres
     tmpfs_dir = pki.install_keys_to_tmpfs(tls_dir, master_key)
@@ -257,11 +268,11 @@ def configure_standby():
     if cluster_file.is_file():
         raise click.ClickException("[VLT-1006] O cofre ja esta configurado neste no.")
 
-    stage_dir = pgdata / "seed_stage"
+    stage_dir = get_seed_stage_dir()
     seed_json = stage_dir / "seed.json"
     if not seed_json.is_file():
         raise click.ClickException(
-            "[VLT-1007] Nenhum seed desempacotado localizado em seed_stage. "
+            "[VLT-1007] Nenhum seed desempacotado localizado em /tmp/vault_seed_stage. "
             "Execute 'vaultctl unpack seed <arquivo|->' primeiro."
         )
 
@@ -304,6 +315,15 @@ def configure_standby():
     if not ready:
         pki.shred_tmpfs_keys(str(tmpfs_dir))
         raise click.ClickException(f"[VLT-1003] Falha ao alcancar o primario em {primary_host}:{primary_port} via mTLS.")
+
+    # Limpa arquivos residuais do pgdata antes do basebackup para evitar erro "directory exists but is not empty"
+    for item in pgdata.iterdir():
+        if item.name == "tls":
+            continue
+        if item.is_dir():
+            shutil.rmtree(str(item), ignore_errors=True)
+        else:
+            item.unlink(missing_ok=True)
 
     # Executa pg_basebackup via mTLS
     click.echo(f"Sincronizando banco inicial a partir de {primary_host}...")
@@ -493,7 +513,7 @@ def unpack_seed(seed_source):
     if len(seed_data) == 0:
         raise click.ClickException("[VLT-1007] O pacote seed fornecido esta vazio.")
 
-    stage_dir = pgdata / "seed_stage"
+    stage_dir = get_seed_stage_dir()
     shutil.rmtree(str(stage_dir), ignore_errors=True)
     stage_dir.mkdir(parents=True, exist_ok=True)
 
