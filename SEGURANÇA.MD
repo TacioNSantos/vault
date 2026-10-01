@@ -108,6 +108,26 @@ Request body: limite global
 - Qualquer requisição de IP não autorizado recebe **`404 Not Found`**, eliminando superfície de ataque, reconhecimento e enumeração por scanners externos.
 - Opcionalmente, pode ser fixado via variável de ambiente `DOCS_ALLOWED_IP`.
 
+---
+
+## 13. Proteção de Chaves Privadas em Repouso e em Trânsito (*.key.enc e tmpfs) [RESOLVIDO]
+
+**Status:** Implementado no modelo Conjur.
+- Chaves privadas TLS (`cluster.key`, `ca.key`) **nunca** tocam o disco persistente em texto puro. São salvas como `*.key.enc` cifradas com a Master Key (AES-256-GCM).
+- No boot do container, as chaves são decifradas exclusivamente para memória volátil (`tmpfs` em `/dev/shm/vault_tls`, modo `0600`).
+- No encerramento do container, as chaves em memória são sobrescritas e destruídas (*shred* via trap `EXIT/TERM/INT`).
+- Pacotes seed gerados para novos nós (`vaultctl seed standby`) contêm apenas chaves cifradas e **nunca incluem a master.key**. A `master.key` deve ser entregue por canal seguro separado pelo administrador.
+
+---
+
+## 14. Replicação Segura via mTLS com pg_ident (Sem Senha Padrão) [RESOLVIDO]
+
+**Status:** Implementado no modelo Conjur.
+- Eliminação total de senhas estáticas de replicação no `entrypoint.sh` ou `Dockerfile`.
+- O streaming de replicação WAL exige **mTLS obrigatório** (`hostssl ... cert map=cluster_map clientcert=verify-full`).
+- O PostgreSQL mapeia a identidade do certificado do cluster para o papel `replicator` via `pg_ident.conf`.
+- Tentativas de conexão sem certificado válido emitido pela Root CA são rejeitadas sumariamente no handshake TLS.
+
 # Prioridade sugerida
 
 1. Corrigir `trust_proxy`.

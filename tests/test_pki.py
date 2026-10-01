@@ -3,12 +3,13 @@ import shutil
 import tempfile
 import unittest
 
-from vault import pki
+from vault import pki, crypto
 
 
 class TestPKIEngine(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
+        self.master_key = crypto.generate_key()
 
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
@@ -35,79 +36,75 @@ class TestPKIEngine(unittest.TestCase):
         loaded_key = pki.load_private_key(pem_key)
         self.assertEqual(loaded_key.key_size, 2048)
 
-    def test_issue_node_certificate_with_sans(self):
+    def test_create_cluster_certificate_with_sans_and_dual_eku(self):
         ca_cert, ca_key = pki.create_root_ca(days_valid=30, key_size=2048)
-        node_cert, node_key = pki.issue_node_certificate(
+        cluster_cert, cluster_key = pki.create_cluster_certificate(
             ca_cert=ca_cert,
             ca_key=ca_key,
-            common_name="vault-primary",
-            sans=["127.0.0.1", "10.10.20.10", "localhost", "vault-primary"],
+            hostname="vault.exemplo.com",
+            altnames=["vault1.exemplo.com", "vault2.exemplo.com", "10.10.20.10", "10.10.20.20"],
             days_valid=30,
             key_size=2048,
         )
 
-        self.assertIsNotNone(node_cert)
-        self.assertIsNotNone(node_key)
-        self.assertTrue(pki.verify_certificate_chain(node_cert, ca_cert))
+        self.assertIsNotNone(cluster_cert)
+        self.assertIsNotNone(cluster_key)
+        self.assertTrue(pki.verify_certificate_chain(cluster_cert, ca_cert))
 
         # Testa validacao de hosts no SAN
-        self.assertTrue(pki.is_certificate_valid_for_host(node_cert, "127.0.0.1"))
-        self.assertTrue(pki.is_certificate_valid_for_host(node_cert, "10.10.20.10"))
-        self.assertTrue(pki.is_certificate_valid_for_host(node_cert, "localhost"))
-        self.assertTrue(pki.is_certificate_valid_for_host(node_cert, "vault-primary"))
-        self.assertFalse(pki.is_certificate_valid_for_host(node_cert, "192.168.1.99"))
-        self.assertFalse(pki.is_certificate_valid_for_host(node_cert, "outro-host"))
+        self.assertTrue(pki.is_certificate_valid_for_host(cluster_cert, "vault.exemplo.com"))
+        self.assertTrue(pki.is_certificate_valid_for_host(cluster_cert, "vault1.exemplo.com"))
+        self.assertTrue(pki.is_certificate_valid_for_host(cluster_cert, "vault2.exemplo.com"))
+        self.assertTrue(pki.is_certificate_valid_for_host(cluster_cert, "10.10.20.10"))
+        self.assertTrue(pki.is_certificate_valid_for_host(cluster_cert, "10.10.20.20"))
+        self.assertTrue(pki.is_certificate_valid_for_host(cluster_cert, "localhost"))
+        self.assertTrue(pki.is_certificate_valid_for_host(cluster_cert, "127.0.0.1"))
+        self.assertFalse(pki.is_certificate_valid_for_host(cluster_cert, "outro-host"))
 
         # Dias restantes
-        self.assertGreaterEqual(pki.cert_days_remaining(node_cert), 28)
+        self.assertGreaterEqual(pki.cert_days_remaining(cluster_cert), 28)
 
-    def test_issue_client_certificate(self):
+    def test_save_encrypted_and_install_to_tmpfs(self):
         ca_cert, ca_key = pki.create_root_ca(days_valid=30, key_size=2048)
-        client_cert, client_key = pki.issue_client_certificate(
+        cluster_cert, cluster_key = pki.create_cluster_certificate(
             ca_cert=ca_cert,
             ca_key=ca_key,
-            common_name="replicator",
-            days_valid=30,
-            key_size=2048,
-        )
-        self.assertIsNotNone(client_cert)
-        self.assertTrue(pki.verify_certificate_chain(client_cert, ca_cert))
-        self.assertTrue(pki.is_certificate_valid_for_host(client_cert, "replicator"))
-
-    def test_save_and_load_pki_bundle(self):
-        ca_cert, ca_key = pki.create_root_ca(days_valid=30, key_size=2048)
-        node_cert, node_key = pki.issue_node_certificate(
-            ca_cert=ca_cert,
-            ca_key=ca_key,
-            common_name="vault-node1",
-            sans=["127.0.0.1"],
-            days_valid=30,
-            key_size=2048,
-        )
-        client_cert, client_key = pki.issue_client_certificate(
-            ca_cert=ca_cert,
-            ca_key=ca_key,
-            common_name="replicator",
+            hostname="vault.cluster",
+            altnames=["10.10.20.10"],
             days_valid=30,
             key_size=2048,
         )
 
-        pki.save_pki_bundle(
-            output_dir=self.tmp_dir,
+        storage_dir = os.path.join(self.tmp_dir, "storage_tls")
+        pki.save_cluster_pki_to_disk(
+            storage_dir=storage_dir,
+            master_key=self.master_key,
             ca_cert=ca_cert,
+            cluster_cert=cluster_cert,
+            cluster_key=cluster_key,
             ca_key=ca_key,
-            node_cert=node_cert,
-            node_key=node_key,
-            client_cert=client_cert,
-            client_key=client_key,
         )
 
-        self.assertTrue(os.path.isfile(os.path.join(self.tmp_dir, "ca.crt")))
-        self.assertTrue(os.path.isfile(os.path.join(self.tmp_dir, "ca.key")))
-        self.assertTrue(os.path.isfile(os.path.join(self.tmp_dir, "server.crt")))
-        self.assertTrue(os.path.isfile(os.path.join(self.tmp_dir, "server.key")))
-        self.assertTrue(os.path.isfile(os.path.join(self.tmp_dir, "client.crt")))
-        self.assertTrue(os.path.isfile(os.path.join(self.tmp_dir, "client.key")))
+        # Chaves privadas no disco sao SEMPRE cifradas (*.key.enc)
+        self.assertTrue(os.path.isfile(os.path.join(storage_dir, "ca.crt")))
+        self.assertTrue(os.path.isfile(os.path.join(storage_dir, "cluster.crt")))
+        self.assertTrue(os.path.isfile(os.path.join(storage_dir, "ca.key.enc")))
+        self.assertTrue(os.path.isfile(os.path.join(storage_dir, "cluster.key.enc")))
+        self.assertFalse(os.path.isfile(os.path.join(storage_dir, "server.key")))
+        self.assertFalse(os.path.isfile(os.path.join(storage_dir, "cluster.key")))
+
+        # Instala chaves decifradas em tmpfs
+        tmpfs_dir = os.path.join(self.tmp_dir, "tmpfs_tls")
+        target = pki.install_keys_to_tmpfs(storage_dir, self.master_key, tmpfs_dir=tmpfs_dir)
+
+        self.assertTrue(os.path.isfile(os.path.join(str(target), "ca.crt")))
+        self.assertTrue(os.path.isfile(os.path.join(str(target), "server.crt")))
+        self.assertTrue(os.path.isfile(os.path.join(str(target), "server.key")))
+        self.assertTrue(os.path.isfile(os.path.join(str(target), "ca.key")))
+
+        # Testa limpeza segura (shred)
+        pki.shred_tmpfs_keys(str(target))
+        self.assertFalse(os.path.exists(str(target)))
 
 
 if __name__ == "__main__":

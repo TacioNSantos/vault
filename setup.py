@@ -14,9 +14,8 @@ setup(
     entry_points={
         "console_scripts": [
             "vaultctl=cli.vaultctl:cli",
-            "vault-init=cli.vault_init:cli",
-            "vault-promote=cli.vault_promote:cli",
             "vault-rescue=cli.rescue:cli",
+            "vault-promote=cli.vault_promote:cli",
         ],
     },
 )

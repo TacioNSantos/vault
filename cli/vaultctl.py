@@ -1,17 +1,30 @@
 """
-vaultctl: CLI unificada de administracao do Vault.
-Suporta init, geracao de seeds para Standby/DR (estilo CyberArk Conjur),
-join de replicas, promocao com anti-split-brain, inspecao de certificados e resgate offline.
+vaultctl: CLI unificada de administracao do Vault no modelo CyberArk Conjur (evoke).
+Suporta:
+- configure primary: Bootstrap do nó líder, schema, admin e PKI (autoassinada ou BYO).
+- configure standby: Configuração da réplica a partir do seed com streaming mTLS.
+- seed standby: Geração de pacote .seed.tar seguro contendo certs mTLS e chaves cifradas (master.key NUNCA inclusa).
+- unpack seed: Desempacotamento e validação de seed via arquivo ou pipe stdin (-).
+- ca issue: Reemissão do certificado de cluster com novos SANs para expansão de nós.
+- role promote: Promoção com checagem anti-split-brain via HTTPS + mTLS.
+- status: Exibição detalhada de papel, cluster, validade de certificados e replicação.
+- rescue: Resgate de emergência offline (Break-Glass).
 """
 
 from __future__ import annotations
 
 import base64
+import datetime
 import io
 import json
 import os
+import shutil
+import ssl
+import subprocess
 import sys
 import tarfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import List, Optional
 
@@ -23,307 +36,693 @@ from vault.database import Base, engine, SessionLocal
 from vault.models import VaultConfig, AppIdentity
 from vault.security import hash_app_secret
 from vault.permissions import Permission
-from cli.vault_promote import cli as promote_cmd
 from cli.rescue import cli as rescue_cmd
 
 
+def get_pgdata() -> Path:
+    return Path(os.environ.get("PGDATA", "/var/lib/postgresql/data")).expanduser().resolve()
+
+
+def get_master_key_file() -> Path:
+    return Path(os.environ.get("MASTER_KEY_FILE", config.MASTER_KEY_FILE)).expanduser().resolve()
+
+
+def load_master_key() -> bytes:
+    key_path = get_master_key_file()
+    if not key_path.is_file():
+        raise click.ClickException(
+            f"[VLT-1001] master.key nao encontrada em {key_path}. "
+            "Monte o arquivo de chave mestra no container antes de executar a operacao."
+        )
+    raw = key_path.read_text(encoding="utf-8").strip()
+    try:
+        key_bytes = base64.b64decode(raw)
+    except Exception:
+        raise click.ClickException("[VLT-1002] master.key com formato invalido (esperado base64).")
+    if len(key_bytes) != crypto.KEY_SIZE:
+        raise click.ClickException(f"[VLT-1002] master.key com tamanho invalido: {len(key_bytes)} bytes.")
+    return key_bytes
+
+
+# =========================================================================
+# ROOT CLI GROUP
+# =========================================================================
 @click.group()
 def cli():
-    """vaultctl - Painel de controle e administracao do Vault."""
+    """vaultctl - Painel de administracao e gerenciamento do Vault."""
     pass
 
 
 # =========================================================================
-# 1. INIT: Inicializa cofre, admin, master.key e PKI / TLS
+# 1. CONFIGURE GROUP (primary / standby)
 # =========================================================================
-@cli.command("init")
-@click.option("--output-dir", default="./vault-init-output", help="Diretorio onde salvar master.key e certificados.")
-@click.option("--admin-name", default="admin", help="Nome do App ID admin criado no setup.")
+@cli.group("configure")
+def configure_group():
+    """Configura o papel e os servicos do no (estilo evoke configure)."""
+    pass
+
+
+@configure_group.command("primary")
+@click.option("--hostname", required=True, help="Nome FQDN ou hostname principal do cluster.")
+@click.option("--altname", "altnames", multiple=True, help="Hostnames ou IPs adicionais (SANs) de todos os nos.")
+@click.option("--admin-name", default="admin", help="Nome do App ID admin inicial.")
 @click.option("--admin-ip", required=True, help="IP ou CIDR de onde o admin pode se autenticar.")
-@click.option("--admin-secret-stdin", is_flag=True, help="Le o secret do admin da entrada padrao.")
-@click.option("--trust-proxy", is_flag=True, default=False, help="Aceita X-Forwarded-For para o admin.")
-@click.option("--enable-tls/--no-tls", default=True, help="Gera Root CA e certificados TLS para o no primario.")
-@click.option("--node-san", multiple=True, help="SANs adicionais (IPs ou hostnames) para o certificado TLS do nó.")
-@click.option("--force", is_flag=True, default=False, help="Reinicializa mesmo se o vault ja tiver config.")
-def init(output_dir, admin_name, admin_ip, admin_secret_stdin, trust_proxy, enable_tls, node_san, force):
-    """Inicializa schema do banco, gera master key, admin inicial e certificados TLS."""
+@click.option("--admin-secret-stdin", is_flag=True, help="Le a senha do admin a partir da entrada padrao.")
+@click.option("--cert", "cert_file", default=None, help="Caminho do certificado do cluster (BYO-Cert).")
+@click.option("--key", "key_file", default=None, help="Caminho da chave privada do cluster (BYO-Cert).")
+@click.option("--ca", "ca_file", default=None, help="Caminho da Root CA / cadeia (BYO-Cert).")
+def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_stdin, cert_file, key_file, ca_file):
+    """Configura o no como Lider (Primario) com banco, admin e PKI (autoassinada ou BYO)."""
+    pgdata = get_pgdata()
+    cluster_file = pgdata / "cluster.json"
+
+    if cluster_file.is_file():
+        raise click.ClickException("[VLT-1006] O cofre ja esta configurado neste no.")
+
+    master_key = load_master_key()
+
     if admin_secret_stdin:
         admin_secret_plain = sys.stdin.readline().rstrip("\r\n")
     else:
         admin_secret_plain = click.prompt("Senha do admin", hide_input=True, confirmation_prompt=True)
     if not admin_secret_plain:
-        raise click.ClickException("A senha do admin nao pode ser vazia")
+        raise click.ClickException("A senha do admin nao pode ser vazia.")
     if len(admin_secret_plain.encode("utf-8")) > 72:
-        raise click.ClickException("A senha do admin deve ter no maximo 72 bytes (limite do bcrypt)")
+        raise click.ClickException("A senha do admin deve ter no maximo 72 bytes (limite do bcrypt).")
 
-    try:
-        Base.metadata.create_all(bind=engine)
-    except OperationalError as e:
-        click.echo(f"[VLT-1003] falha ao conectar/criar schema no Postgres: {e}", err=True)
-        sys.exit(1)
-
-    db = SessionLocal()
-    try:
-        existing = db.query(VaultConfig).filter(VaultConfig.key == config.VERIFICATION_CONFIG_KEY).first()
-        if existing and not force:
-            click.echo("[VLT-1006] vault ja inicializado. Use --force para reinicializar.", err=True)
-            sys.exit(1)
-
-        if existing and force:
-            db.query(VaultConfig).delete()
-            db.query(AppIdentity).delete()
-            db.commit()
-
-        out_path = Path(output_dir).expanduser().resolve()
-        out_path.mkdir(parents=True, exist_ok=True)
-
-        # 1. Master key
-        master_key = crypto.generate_key()
-
-        # 2. Verification blob
-        verification_blob = crypto.encrypt(master_key, config.VERIFICATION_PLAINTEXT)
-        db.add(VaultConfig(key=config.VERIFICATION_CONFIG_KEY, value=verification_blob))
-
-        # 3. JWT signing key
-        jwt_signing_key = crypto.generate_key()
-        encrypted_jwt_key = crypto.encrypt(master_key, jwt_signing_key)
-        db.add(VaultConfig(key=config.JWT_SIGNING_KEY_CONFIG_KEY, value=encrypted_jwt_key))
-
-        # 4. Admin App ID
-        admin_app = AppIdentity(
-            name=admin_name,
-            secret_hash=hash_app_secret(admin_secret_plain),
-            allowed_ip=admin_ip,
-            trust_proxy=trust_proxy,
-            is_admin=True,
+    # 1. Processamento da PKI (BYO ou Autoassinada)
+    all_altnames = list(altnames)
+    ca_key = None
+    if cert_file or key_file or ca_file:
+        if not (cert_file and key_file and ca_file):
+            raise click.ClickException("[VLT-1009] Para BYO-Cert, informe --cert, --key e --ca.")
+        c_bytes = Path(cert_file).read_bytes()
+        k_bytes = Path(key_file).read_bytes()
+        ca_bytes = Path(ca_file).read_bytes()
+        try:
+            cluster_cert, cluster_key, ca_cert, warning = pki.validate_byo_certificates(
+                c_bytes, k_bytes, ca_bytes, hostname, all_altnames
+            )
+            if warning:
+                click.echo(warning, err=True)
+        except pki.BYOValidationError as e:
+            raise click.ClickException(f"[{e.code}] Falha na validacao BYO: {e.message}")
+        ca_type = "byo"
+    else:
+        # Gera Root CA e Certificado Unico de Cluster
+        ca_cert, ca_key = pki.create_root_ca(
+            common_name=f"Vault CA ({hostname})",
+            organization="Vault Cluster PKI",
         )
-        admin_app.permissions = {Permission.Create}
-        db.add(admin_app)
+        cluster_cert, cluster_key = pki.create_cluster_certificate(
+            ca_cert, ca_key, hostname, all_altnames
+        )
+        ca_type = "internal"
 
-        db.commit()
+    # 2. Salva PKI no volume com chaves privadas cifradas
+    tls_dir = pgdata / "tls"
+    pki.save_cluster_pki_to_disk(
+        tls_dir, master_key, ca_cert, cluster_cert, cluster_key, ca_key
+    )
 
-        # Salva master.key
-        key_file = out_path / "master.key"
-        key_file.write_text(base64.b64encode(master_key).decode("ascii") + "\n", encoding="utf-8")
+    # 3. Inicializa PostgreSQL caso o diretorio de dados esteja virgem
+    pgdata.mkdir(parents=True, exist_ok=True)
+    if not (pgdata / "PG_VERSION").is_file():
+        subprocess.run(["gosu", "postgres", "initdb", "-D", str(pgdata)], check=True, stdout=subprocess.DEVNULL)
+        db_pass = crypto.b64encode(crypto.generate_key())
+        (pgdata / ".db_password").write_text(db_pass, encoding="utf-8")
         if os.name != "nt":
-            key_file.chmod(0o600)
+            (pgdata / ".db_password").chmod(0o600)
+            os.chown(str(pgdata / ".db_password"), 0, 0)
 
-        # 5. Gera PKI / TLS se habilitado
-        if enable_tls:
-            tls_dir = out_path / "tls"
-            sans = ["127.0.0.1", "localhost", "vault-primary"]
-            if node_san:
-                sans.extend(node_san)
+    # 4. Decifra chaves para tmpfs temporario para subir o Postgres
+    tmpfs_dir = pki.install_keys_to_tmpfs(tls_dir, master_key)
 
-            ca_cert, ca_key = pki.create_root_ca(
-                common_name="Vault Root CA",
-                organization="Vault Cluster PKI",
-            )
-            node_cert, node_key = pki.issue_node_certificate(
-                ca_cert=ca_cert,
-                ca_key=ca_key,
-                common_name="vault-primary",
-                sans=sans,
-            )
-            client_cert, client_key = pki.issue_client_certificate(
-                ca_cert=ca_cert,
-                ca_key=ca_key,
-                common_name="replicator",
-            )
-            pki.save_pki_bundle(
-                output_dir=tls_dir,
-                ca_cert=ca_cert,
-                ca_key=ca_key,
-                node_cert=node_cert,
-                node_key=node_key,
-                client_cert=client_cert,
-                client_key=client_key,
-            )
-            click.echo(f"  Certificados TLS salvos em: {tls_dir}")
+    # 5. Inicia Postgres local temporariamente para criar o schema
+    pg_opts = f"-c listen_addresses='localhost' -c ssl=on -c ssl_cert_file={tmpfs_dir}/server.crt -c ssl_key_file={tmpfs_dir}/server.key -c ssl_ca_file={tmpfs_dir}/ca.crt"
+    subprocess.run(["gosu", "postgres", "pg_ctl", "-D", str(pgdata), "-o", pg_opts, "-w", "start"], check=True)
 
-        click.echo(f"\n[SUCESSO] Vault inicializado.")
-        click.echo(f"  master.key salva em: {key_file}")
-        click.echo(f"  Admin '{admin_name}' configurado para IP: {admin_ip}")
+    try:
+        # Cria usuario e banco se nao existirem
+        pass_val = (pgdata / ".db_password").read_text(encoding="utf-8").strip()
+        subprocess.run(
+            ["gosu", "postgres", "psql", "-c", f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vault') THEN CREATE USER vault WITH NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{pass_val}'; END IF; END $$;"],
+            check=True, stdout=subprocess.DEVNULL
+        )
+        subprocess.run(
+            ["gosu", "postgres", "psql", "-c", "SELECT 1 FROM pg_database WHERE datname = 'vault'"],
+            capture_output=True, check=True
+        )
+        subprocess.run(
+            ["gosu", "postgres", "psql", "-c", "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'vault') THEN CREATE DATABASE vault OWNER vault; END IF; END $$;"],
+            check=True, stdout=subprocess.DEVNULL
+        )
+        subprocess.run(
+            ["gosu", "postgres", "psql", "-d", "vault", "-c", "GRANT ALL ON SCHEMA public TO vault;"],
+            check=True, stdout=subprocess.DEVNULL
+        )
+
+        # Atualiza DATABASE_URL
+        db_url = f"postgresql+psycopg2://vault:{pass_val}@localhost:5432/vault"
+        os.environ["DATABASE_URL"] = db_url
+        (pgdata / ".database_url").write_text(db_url, encoding="utf-8")
+
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        try:
+            # Master key verification blob
+            v_blob = crypto.encrypt(master_key, config.VERIFICATION_PLAINTEXT)
+            db.add(VaultConfig(key=config.VERIFICATION_CONFIG_KEY, value=v_blob))
+
+            # JWT signing key
+            jwt_key = crypto.generate_key()
+            jwt_enc = crypto.encrypt(master_key, jwt_key)
+            db.add(VaultConfig(key=config.JWT_SIGNING_KEY_CONFIG_KEY, value=jwt_enc))
+
+            # Admin App ID
+            admin_app = AppIdentity(
+                name=admin_name,
+                secret_hash=hash_app_secret(admin_secret_plain),
+                allowed_ip=admin_ip,
+                trust_proxy=False,
+                is_admin=True,
+            )
+            admin_app.permissions = {Permission.Create}
+            db.add(admin_app)
+            db.commit()
+        finally:
+            db.close()
     finally:
-        db.close()
+        subprocess.run(["gosu", "postgres", "pg_ctl", "-D", str(pgdata), "-m", "fast", "-w", "stop"], check=True)
+        pki.shred_tmpfs_keys(str(tmpfs_dir))
+
+    # 6. Grava cluster.json definitivo
+    cluster_meta = {
+        "role": "primary",
+        "hostname": hostname,
+        "altnames": all_altnames,
+        "ca_type": ca_type,
+        "primary_port": 5432,
+        "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    cluster_file.write_text(json.dumps(cluster_meta, indent=2), encoding="utf-8")
+
+    click.echo(f"\n[SUCESSO] No Lider configurado com sucesso!")
+    click.echo(f"• Cluster Hostname: {hostname}")
+    click.echo(f"• SANs Registrados: {', '.join(pki.get_certificate_sans(cluster_cert))}")
+    click.echo(f"• Admin Provisionado: {admin_name} ({admin_ip})")
+    click.echo("O container principal agora iniciara os servicos automaticamente.")
+
+
+@configure_group.command("standby")
+def configure_standby():
+    """Configura o no como Standby (Replica) utilizando os dados do seed desempacotado."""
+    pgdata = get_pgdata()
+    cluster_file = pgdata / "cluster.json"
+    if cluster_file.is_file():
+        raise click.ClickException("[VLT-1006] O cofre ja esta configurado neste no.")
+
+    stage_dir = pgdata / "seed_stage"
+    seed_json = stage_dir / "seed.json"
+    if not seed_json.is_file():
+        raise click.ClickException(
+            "[VLT-1007] Nenhum seed desempacotado localizado em seed_stage. "
+            "Execute 'vaultctl unpack seed <arquivo|->' primeiro."
+        )
+
+    meta = json.loads(seed_json.read_text(encoding="utf-8"))
+    primary_host = meta["primary_host"]
+    primary_port = meta.get("primary_port", 5432)
+    master_key = load_master_key()
+
+    # Move os certificados e chaves cifradas do seed_stage para $PGDATA/tls
+    tls_dir = pgdata / "tls"
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("ca.crt", "cluster.crt", "cluster.key.enc", "ca.key.enc"):
+        src = stage_dir / fname
+        if src.is_file():
+            shutil.copyfile(str(src), str(tls_dir / fname))
+
+    # Decifra chaves para tmpfs para o pg_basebackup usar mTLS
+    tmpfs_dir = pki.install_keys_to_tmpfs(tls_dir, master_key)
+
+    # Aguarda o nó primário responder
+    click.echo(f"Aguardando conectividade com o primario em {primary_host}:{primary_port}...")
+    env = os.environ.copy()
+    env["PGSSLMODE"] = "verify-full"
+    env["PGSSLROOTCERT"] = str(tmpfs_dir / "ca.crt")
+    env["PGSSLCERT"] = str(tmpfs_dir / "server.crt")
+    env["PGSSLKEY"] = str(tmpfs_dir / "server.key")
+
+    ready = False
+    for _ in range(30):
+        res = subprocess.run(
+            ["pg_isready", "-h", primary_host, "-p", str(primary_port), "-U", "replicator", "-d", "postgres", "-q"],
+            env=env
+        )
+        if res.returncode == 0:
+            ready = True
+            break
+        import time
+        time.sleep(2)
+
+    if not ready:
+        pki.shred_tmpfs_keys(str(tmpfs_dir))
+        raise click.ClickException(f"[VLT-1003] Falha ao alcancar o primario em {primary_host}:{primary_port} via mTLS.")
+
+    # Executa pg_basebackup via mTLS
+    click.echo(f"Sincronizando banco inicial a partir de {primary_host}...")
+    backup_cmd = [
+        "gosu", "postgres", "pg_basebackup",
+        "-h", primary_host, "-p", str(primary_port),
+        "-U", "replicator", "-D", str(pgdata),
+        "-Fp", "-Xs", "-R",
+    ]
+    res_backup = subprocess.run(backup_cmd, env=env)
+    if res_backup.returncode != 0:
+        pki.shred_tmpfs_keys(str(tmpfs_dir))
+        raise click.ClickException("[VLT-1003] Falha no pg_basebackup a partir do lider.")
+
+    # Restaura certificados tls no volume (se basebackup tiver limpado)
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("ca.crt", "cluster.crt", "cluster.key.enc", "ca.key.enc"):
+        src = stage_dir / fname
+        if src.is_file():
+            shutil.copyfile(str(src), str(tls_dir / fname))
+
+    # Ajusta primary_conninfo no postgresql.auto.conf para mTLS definitivo
+    auto_conf = pgdata / "postgresql.auto.conf"
+    if auto_conf.is_file():
+        conninfo_line = (
+            f"primary_conninfo = 'host={primary_host} port={primary_port} user=replicator "
+            f"sslmode=verify-full sslrootcert=/dev/shm/vault_tls/ca.crt "
+            f"sslcert=/dev/shm/vault_tls/server.crt sslkey=/dev/shm/vault_tls/server.key'\n"
+        )
+        # Substitui linha primary_conninfo
+        lines = auto_conf.read_text(encoding="utf-8").splitlines()
+        new_lines = [l for l in lines if not l.startswith("primary_conninfo")]
+        new_lines.append(conninfo_line)
+        auto_conf.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    # Limpa stage e tmpfs
+    shutil.rmtree(str(stage_dir), ignore_errors=True)
+    pki.shred_tmpfs_keys(str(tmpfs_dir))
+
+    # Grava cluster.json definitivo
+    meta["configured_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cluster_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    click.echo(f"\n[SUCESSO] No Standby configurado com sucesso!")
+    click.echo(f"• Conectado ao Lider: {primary_host}:{primary_port}")
+    click.echo("O container principal agora iniciara o streaming de replicacao e a API.")
 
 
 # =========================================================================
-# 2. SEED: Cria pacote de inicializacao para nó Standby / DR (Estilo Conjur)
+# 2. SEED STANDBY: Gera o pacote .seed.tar para nova réplica
 # =========================================================================
 @cli.group("seed")
 def seed_group():
-    """Gera pacotes seed para inicializar novos nós no cluster."""
+    """Gera pacotes seed cifrados para expansao do cluster (estilo evoke seed)."""
     pass
 
 
 @seed_group.command("standby")
 @click.argument("target_host")
-@click.option("--name", default=None, help="Nome do nó standby (default: vault-standby-<host>).")
-@click.option("--key", default="./vault-init-output/master.key", help="Caminho da master.key original.")
-@click.option("--tls-dir", default="./vault-init-output/tls", help="Caminho dos certificados TLS da CA.")
-@click.option("--primary-host", default="vault-primary", help="Hostname/IP do primario para replicacao.")
-@click.option("--primary-port", default=5432, type=int, help="Porta do PostgreSQL do primario.")
-@click.option("--output", default=None, help="Arquivo .seed.tar de saida (default: <nome>.seed.tar).")
-def seed_standby(target_host, name, key, tls_dir, primary_host, primary_port, output):
-    """Gera um pacote .seed.tar seguro contendo certs mTLS e master.key para uma nova réplica."""
-    key_path = Path(key).expanduser().resolve()
-    tls_path = Path(tls_dir).expanduser().resolve()
+@click.option("--primary-host", default=None, help="Hostname/IP do lider pelo qual a replica ira se conectar.")
+@click.option("--primary-port", default=5432, type=int, help="Porta do PostgreSQL do lider.")
+@click.option("--output", "-o", default=None, help="Arquivo .seed.tar de saida (padrao: stdout).")
+def seed_standby(target_host, primary_host, primary_port, output):
+    """Gera pacote seed cifrado para o nó standby alvo. Master key NUNCA inclusa."""
+    pgdata = get_pgdata()
+    cluster_file = pgdata / "cluster.json"
 
-    if not key_path.is_file():
-        raise click.ClickException(f"master.key nao encontrada em: {key_path}")
+    if not cluster_file.is_file():
+        raise click.ClickException("[VLT-1005] O cofre nao esta configurado neste no.")
 
-    node_name = name or f"vault-standby-{target_host.replace('.', '-').replace(':', '-')}"
-    out_file = output or f"{node_name}.seed.tar"
+    cluster_meta = json.loads(cluster_file.read_text(encoding="utf-8"))
+    if cluster_meta.get("role") != "primary":
+        raise click.ClickException("[VLT-5001] Somente o no lider (primario) pode gerar seeds.")
 
-    ca_crt_path = tls_path / "ca.crt"
-    ca_key_path = tls_path / "ca.key"
+    p_host = primary_host or cluster_meta.get("hostname", "vault-primary")
+    tls_dir = pgdata / "tls"
 
-    if not ca_crt_path.is_file() or not ca_key_path.is_file():
-        raise click.ClickException(f"CA TLS nao encontrada em {tls_path} (necessario ca.crt e ca.key)")
+    cluster_crt_path = tls_dir / "cluster.crt"
+    cluster_key_enc_path = tls_dir / "cluster.key.enc"
+    ca_crt_path = tls_dir / "ca.crt"
+    ca_key_enc_path = tls_dir / "ca.key.enc"
 
-    ca_cert = pki.load_certificate(ca_crt_path.read_bytes())
-    ca_key = pki.load_private_key(ca_key_path.read_bytes())
+    if not (cluster_crt_path.is_file() and cluster_key_enc_path.is_file() and ca_crt_path.is_file()):
+        raise click.ClickException("[VLT-1008] Componentes de PKI ausentes no volume.")
 
-    # Emite certificado exclusivo para o novo nó Standby
-    sans = [target_host, "localhost", "127.0.0.1", node_name]
-    node_cert, node_key = pki.issue_node_certificate(
-        ca_cert=ca_cert,
-        ca_key=ca_key,
-        common_name=node_name,
-        sans=sans,
-    )
+    # Verifica se o target_host esta coberto nos SANs do certificado do cluster
+    cluster_cert = pki.load_certificate(cluster_crt_path.read_bytes())
+    if not pki.is_certificate_valid_for_host(cluster_cert, target_host):
+        click.echo(
+            f"Aviso: O target_host '{target_host}' nao consta nos SANs do certificado de cluster! "
+            f"Se necessario, execute 'vaultctl ca issue --force {target_host}' antes de gerar os seeds.",
+            err=True
+        )
 
-    # Emite certificado de cliente replicator para mTLS com o primario
-    client_cert, client_key = pki.issue_client_certificate(
-        ca_cert=ca_cert,
-        ca_key=ca_key,
-        common_name="replicator",
-    )
+    # Se BYO (sem ca.key.enc), avisa no stderr
+    has_ca_key = ca_key_enc_path.is_file()
+    if not has_ca_key:
+        click.echo("Info: CA corporativa externa em uso (ca.key ausente). Standby nao podera reemitir certs.", err=True)
 
-    # Prepara metadados do seed
     seed_meta = {
         "role": "standby",
-        "node_name": node_name,
         "target_host": target_host,
-        "primary_host": primary_host,
+        "primary_host": p_host,
         "primary_port": primary_port,
-        "created_at": str(os.environ.get("SOURCE_DATE_EPOCH", "")),
+        "cluster_hostname": cluster_meta.get("hostname"),
+        "altnames": cluster_meta.get("altnames", []),
+        "ca_type": cluster_meta.get("ca_type", "internal"),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
-    # Empacota tudo em um arquivo tar em memoria/disco
-    with tarfile.open(out_file, "w") as tar:
-        # 1. master.key
-        key_data = key_path.read_bytes()
-        ti = tarfile.TarInfo(name="master.key")
-        ti.size = len(key_data)
-        ti.mode = 0o600
-        tar.addfile(ti, io.BytesIO(key_data))
+    tar_stream = io.BytesIO()
+    with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+        # 1. seed.json
+        meta_bytes = json.dumps(seed_meta, indent=2).encode("utf-8")
+        ti = tarfile.TarInfo(name="seed.json")
+        ti.size = len(meta_bytes)
+        ti.mode = 0o644
+        tar.addfile(ti, io.BytesIO(meta_bytes))
 
-        # 2. tls/ca.crt
-        ca_data = pki.serialize_certificate(ca_cert)
-        ti = tarfile.TarInfo(name="tls/ca.crt")
+        # 2. ca.crt
+        ca_data = ca_crt_path.read_bytes()
+        ti = tarfile.TarInfo(name="ca.crt")
         ti.size = len(ca_data)
         ti.mode = 0o644
         tar.addfile(ti, io.BytesIO(ca_data))
 
-        # 3. tls/server.crt e tls/server.key
-        srv_crt = pki.serialize_certificate(node_cert)
-        ti = tarfile.TarInfo(name="tls/server.crt")
-        ti.size = len(srv_crt)
-        ti.mode = 0o644
-        tar.addfile(ti, io.BytesIO(srv_crt))
+        # 3. ca.key.enc (se existir)
+        if has_ca_key:
+            ca_k_data = ca_key_enc_path.read_bytes()
+            ti = tarfile.TarInfo(name="ca.key.enc")
+            ti.size = len(ca_k_data)
+            ti.mode = 0o600
+            tar.addfile(ti, io.BytesIO(ca_k_data))
 
-        srv_key = pki.serialize_private_key(node_key)
-        ti = tarfile.TarInfo(name="tls/server.key")
-        ti.size = len(srv_key)
+        # 4. cluster.crt
+        c_data = cluster_crt_path.read_bytes()
+        ti = tarfile.TarInfo(name="cluster.crt")
+        ti.size = len(c_data)
+        ti.mode = 0o644
+        tar.addfile(ti, io.BytesIO(c_data))
+
+        # 5. cluster.key.enc (chaves sempre cifradas com a master.key)
+        k_enc_data = cluster_key_enc_path.read_bytes()
+        ti = tarfile.TarInfo(name="cluster.key.enc")
+        ti.size = len(k_enc_data)
         ti.mode = 0o600
-        tar.addfile(ti, io.BytesIO(srv_key))
+        tar.addfile(ti, io.BytesIO(k_enc_data))
 
-        # 4. tls/client.crt e tls/client.key
-        cli_crt = pki.serialize_certificate(client_cert)
-        ti = tarfile.TarInfo(name="tls/client.crt")
-        ti.size = len(cli_crt)
-        ti.mode = 0o644
-        tar.addfile(ti, io.BytesIO(cli_crt))
+    seed_bytes = tar_stream.getvalue()
 
-        cli_key = pki.serialize_private_key(client_key)
-        ti = tarfile.TarInfo(name="tls/client.key")
-        ti.size = len(cli_key)
-        ti.mode = 0o600
-        tar.addfile(ti, io.BytesIO(cli_key))
+    click.echo("Aviso: o pacote seed contem material criptografico do cluster cifrado com a master key.", err=True)
 
-        # 5. seed.json
-        meta_data = json.dumps(seed_meta, indent=2).encode("utf-8")
-        ti = tarfile.TarInfo(name="seed.json")
-        ti.size = len(meta_data)
-        ti.mode = 0o644
-        tar.addfile(ti, io.BytesIO(meta_data))
-
-    click.echo(f"\n[SUCESSO] Pacote seed gerado com sucesso em: {out_file}")
-    click.echo(f"• Nó Alvo:       {node_name} ({target_host})")
-    click.echo(f"• Primário:      {primary_host}:{primary_port}")
-    click.echo(f"\nPróximo passo na máquina réplica:")
-    click.echo(f"  1. Copie o arquivo: scp {out_file} user@{target_host}:/caminho/")
-    click.echo(f"  2. Na réplica execute: vaultctl join --seed {out_file}\n")
+    if output and output != "-":
+        out_p = Path(output).expanduser().resolve()
+        out_p.write_bytes(seed_bytes)
+        click.echo(f"Seed gravado em: {out_p}", err=True)
+    else:
+        # Escreve tar binario no stdout limpo (para suporte a pipe ssh)
+        sys.stdout.buffer.write(seed_bytes)
+        sys.stdout.buffer.flush()
 
 
 # =========================================================================
-# 3. JOIN: Configura nó local usando pacote seed
+# 3. UNPACK GROUP: Desempacota e valida o seed
 # =========================================================================
-@cli.command("join")
-@click.option("--seed", required=True, help="Caminho do arquivo .seed.tar recebido do primário.")
-@click.option("--output-dir", default="./vault-config", help="Diretório onde desempacotar as configurações.")
-def join(seed, output_dir):
-    """Desempacota o arquivo seed e prepara a réplica para conexão mTLS com o primário."""
-    seed_path = Path(seed).expanduser().resolve()
-    if not seed_path.is_file():
-        raise click.ClickException(f"Arquivo seed nao encontrado em: {seed_path}")
+@cli.group("unpack")
+def unpack_group():
+    """Desempacota pacotes de configuracao (estilo evoke unpack)."""
+    pass
 
-    out_path = Path(output_dir).expanduser().resolve()
-    out_path.mkdir(parents=True, exist_ok=True)
 
-    with tarfile.open(seed_path, "r") as tar:
-        tar.extractall(path=out_path)
+@unpack_group.command("seed")
+@click.argument("seed_source")
+def unpack_seed(seed_source):
+    """Desempacota e valida o arquivo seed a partir de um arquivo ou stdin (-)."""
+    pgdata = get_pgdata()
+    master_key = load_master_key()
 
-    seed_json_path = out_path / "seed.json"
-    if not seed_json_path.is_file():
-        raise click.ClickException("Arquivo seed.json ausente no pacote seed.")
+    if seed_source == "-":
+        seed_data = sys.stdin.buffer.read()
+    else:
+        seed_file = Path(seed_source).expanduser().resolve()
+        if not seed_file.is_file():
+            raise click.ClickException(f"Arquivo seed nao encontrado em: {seed_file}")
+        seed_data = seed_file.read_bytes()
 
-    meta = json.loads(seed_json_path.read_text(encoding="utf-8"))
+    if len(seed_data) == 0:
+        raise click.ClickException("[VLT-1007] O pacote seed fornecido esta vazio.")
 
-    click.echo("\n=======================================================")
-    click.echo("           NÓ RECEPTOR STANDBY CONFIGURADO             ")
-    click.echo("=======================================================")
-    click.echo(f"• Nome do Nó:    {meta.get('node_name')}")
-    click.echo(f"• Primário Host: {meta.get('primary_host')}:{meta.get('primary_port')}")
-    click.echo(f"• Arquivos em:   {out_path}")
-    click.echo("\nComando Docker para subir o container Standby mTLS:")
+    stage_dir = pgdata / "seed_stage"
+    shutil.rmtree(str(stage_dir), ignore_errors=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(seed_data), mode="r") as tar:
+            tar.extractall(path=stage_dir)
+    except Exception as e:
+        shutil.rmtree(str(stage_dir), ignore_errors=True)
+        raise click.ClickException(f"[VLT-1007] Pacote seed corrompido ou formato tar invalido: {e}")
+
+    # Valida componentes obrigatorios
+    for req in ("seed.json", "ca.crt", "cluster.crt", "cluster.key.enc"):
+        if not (stage_dir / req).is_file():
+            shutil.rmtree(str(stage_dir), ignore_errors=True)
+            raise click.ClickException(f"[VLT-1008] Componente obrigatorio ausente no seed: {req}")
+
+    # Garante que a master.key NAO foi enviada no seed
+    if (stage_dir / "master.key").is_file():
+        shutil.rmtree(str(stage_dir), ignore_errors=True)
+        raise click.ClickException("[VLT-1007] Violacao de seguranca: o seed contem master.key. O pacote foi rejeitado.")
+
+    # Valida criptografia: tenta decifrar a chave do cluster com a master.key deste nó
+    try:
+        cluster_enc = (stage_dir / "cluster.key.enc").read_bytes()
+        pki.decrypt_private_key(cluster_enc, master_key)
+    except pki.PKIError as e:
+        shutil.rmtree(str(stage_dir), ignore_errors=True)
+        raise click.ClickException(
+            f"[{e.code}] A master.key montada neste no NAO foi capaz de decifrar o seed! "
+            "Certifique-se de que a mesma master.key do lider foi entregue e montada."
+        )
+
     click.echo(
-        f"docker run -d --name {meta.get('node_name')} \\\n"
-        f"  -p 8000:8000 \\\n"
-        f"  -e REPLICATION_ROLE=standby \\\n"
-        f"  -e PRIMARY_HOST={meta.get('primary_host')} \\\n"
-        f"  -e PRIMARY_PORT={meta.get('primary_port')} \\\n"
-        f"  --mount type=bind,source={out_path}/master.key,target=/run/secrets/master.key,readonly \\\n"
-        f"  --mount type=bind,source={out_path}/tls,target=/run/secrets/tls,readonly \\\n"
-        f"  -v {meta.get('node_name')}-data:/var/lib/postgresql/data vault\n"
+        "[SUCESSO] Seed desempacotado e validado com sucesso. "
+        "Execute 'vaultctl configure standby' para sincronizar o no."
     )
 
 
 # =========================================================================
-# 4. CERTS: Inspecao e Renovacao de Certificados
+# 4. CA GROUP: Reemissao de Certificado de Cluster
+# =========================================================================
+@cli.group("ca")
+def ca_group():
+    """Gerenciamento da autoridade certificadora (estilo evoke ca)."""
+    pass
+
+
+@ca_group.command("issue")
+@click.argument("hostnames", nargs=-1, required=True)
+@click.option("--force", is_flag=True, default=False, help="Forca a reemissao do certificado de cluster.")
+def ca_issue(hostnames, force):
+    """Reemite o certificado do cluster incluindo novos SANs (hostnames/IPs)."""
+    pgdata = get_pgdata()
+    cluster_file = pgdata / "cluster.json"
+
+    if not cluster_file.is_file():
+        raise click.ClickException("[VLT-1005] O cofre nao esta configurado neste no.")
+
+    cluster_meta = json.loads(cluster_file.read_text(encoding="utf-8"))
+    if cluster_meta.get("role") != "primary":
+        raise click.ClickException("[VLT-5001] Somente o lider pode reemitir certificados de cluster.")
+
+    tls_dir = pgdata / "tls"
+    ca_key_enc_path = tls_dir / "ca.key.enc"
+    ca_crt_path = tls_dir / "ca.crt"
+
+    if not (ca_key_enc_path.is_file() and ca_crt_path.is_file()):
+        raise click.ClickException(
+            "[VLT-1010] ca.key.enc ausente. Com CA corporativa externa, a reemissao deve ser feita na PKI externa."
+        )
+
+    master_key = load_master_key()
+    ca_cert = pki.load_certificate(ca_crt_path.read_bytes())
+    ca_key = pki.decrypt_private_key(ca_key_enc_path.read_bytes(), master_key)
+
+    # Mescla SANs existentes com os novos
+    current_altnames = set(cluster_meta.get("altnames", []))
+    current_altnames.update(hostnames)
+    new_altnames = sorted(list(current_altnames))
+
+    hostname = cluster_meta.get("hostname", "vault-cluster")
+    cluster_cert, cluster_key = pki.create_cluster_certificate(
+        ca_cert, ca_key, hostname, new_altnames
+    )
+
+    # Salva no disco cifrado
+    pki.save_cluster_pki_to_disk(tls_dir, master_key, ca_cert, cluster_cert, cluster_key, ca_key)
+
+    # Atualiza cluster.json
+    cluster_meta["altnames"] = new_altnames
+    cluster_file.write_text(json.dumps(cluster_meta, indent=2), encoding="utf-8")
+
+    click.echo(f"[SUCESSO] Certificado de cluster reemitido com sucesso!")
+    click.echo(f"• Novos SANs: {', '.join(pki.get_certificate_sans(cluster_cert))}")
+    click.echo(
+        "\nATENCAO: E necessario regenerar os pacotes seed ('vaultctl seed standby ...') "
+        "e redistribuir o novo certificado para as replicas existentes do cluster."
+    )
+
+
+# =========================================================================
+# 5. ROLE GROUP: Promocao com Anti-Split-Brain (role promote / promote)
+# =========================================================================
+@cli.group("role")
+def role_group():
+    """Gerenciamento de papeis operacionais dos nos."""
+    pass
+
+
+def execute_promotion(force: bool = False):
+    pgdata = get_pgdata()
+    cluster_file = pgdata / "cluster.json"
+
+    if not cluster_file.is_file():
+        raise click.ClickException("[VLT-1005] O cofre nao esta configurado neste no.")
+
+    cluster_meta = json.loads(cluster_file.read_text(encoding="utf-8"))
+    if cluster_meta.get("role") != "standby":
+        click.echo(f"O no ja opera como {cluster_meta.get('role')}.")
+        return
+
+    primary_host = cluster_meta.get("primary_host")
+    ca_crt_path = pgdata / "tls" / "ca.crt"
+
+    # Checagem ativa anti-split-brain via HTTPS seguro
+    if primary_host and not force:
+        click.echo(f"Verificando status do lider anterior em https://{primary_host}:8000/health...")
+        ctx = ssl.create_default_context(cafile=str(ca_crt_path) if ca_crt_path.is_file() else None)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE if not ca_crt_path.is_file() else ssl.CERT_REQUIRED
+
+        leader_active = False
+        check_error = None
+        try:
+            req = urllib.request.Request(f"https://{primary_host}:8000/health")
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode())
+                    if data.get("role") == "primary":
+                        leader_active = True
+        except Exception as e:
+            check_error = str(e)
+
+        if leader_active:
+            raise click.ClickException(
+                f"\n[VLT-5003] [SPLIT-BRAIN BLOCKED] O no primario '{primary_host}' ainda esta ATIVO e respondendo como MASTER!\n"
+                "Promover a replica agora geraria divergencia irreversivel de dados.\n"
+                "Desligue o container do primario antes de promover, ou use --force se o primario foi fisicamente isolado."
+            )
+
+        if check_error and not force:
+            click.echo(
+                f"[Aviso] Nao foi possivel contatar o primario ({check_error}).\n"
+                "Para evitar Split-Brain acidental, use 'vaultctl role promote --force' para confirmar que o lider esta inoperante.",
+                err=True
+            )
+            sys.exit(1)
+
+    click.echo(f"Promovendo no PostgreSQL em {pgdata} para primario...")
+    res = subprocess.run(["gosu", "postgres", "pg_ctl", "-D", str(pgdata), "promote"])
+    if res.returncode != 0:
+        raise click.ClickException("[VLT-5002] Falha ao executar promocao no PostgreSQL.")
+
+    cluster_meta["role"] = "primary"
+    cluster_file.write_text(json.dumps(cluster_meta, indent=2), encoding="utf-8")
+
+    click.echo("[SUCESSO] No promovido a Lider (Primario). Agora aceita operacoes de escrita.")
+
+
+@role_group.command("promote")
+@click.option("--force", is_flag=True, default=False, help="Ignora a checagem anti-split-brain.")
+def role_promote_cmd(force):
+    """Promove um no standby a primario de escrita com protecao anti-split-brain."""
+    execute_promotion(force=force)
+
+
+# Alias de alto nivel 'vaultctl promote'
+@cli.command("promote")
+@click.option("--force", is_flag=True, default=False, help="Ignora a checagem anti-split-brain.")
+def promote_alias_cmd(force):
+    """Promove um no standby a primario (alias para 'vaultctl role promote')."""
+    execute_promotion(force=force)
+
+
+# =========================================================================
+# 6. STATUS: Exibe papel, certificados e replicação
+# =========================================================================
+@cli.command("status")
+def status_cmd():
+    """Exibe o estado operacional do no, validade de certificados e replicacao."""
+    pgdata = get_pgdata()
+    cluster_file = pgdata / "cluster.json"
+
+    click.echo("=======================================================")
+    click.echo("                  VAULT CLUSTER STATUS                 ")
+    click.echo("=======================================================")
+
+    if not cluster_file.is_file():
+        click.echo("• Estado:       NAO CONFIGURADO (unconfigured)")
+        click.echo("  Aguardando provisionamento via 'vaultctl configure primary' ou 'vaultctl configure standby'")
+        return
+
+    meta = json.loads(cluster_file.read_text(encoding="utf-8"))
+    role = meta.get("role", "desconhecido").upper()
+    click.echo(f"• Papel:        {role}")
+    click.echo(f"• Hostname:     {meta.get('hostname')}")
+    click.echo(f"• Tipo de CA:   {meta.get('ca_type')}")
+    if meta.get("primary_host"):
+        click.echo(f"• Lider Remoto: {meta.get('primary_host')}:{meta.get('primary_port', 5432)}")
+
+    tls_crt = pgdata / "tls" / "cluster.crt"
+    if tls_crt.is_file():
+        cert = pki.load_certificate(tls_crt.read_bytes())
+        days = pki.cert_days_remaining(cert)
+        click.echo(f"• Certificado:  {days} dias restantes ({'VALIDO' if days > 0 else 'EXPIRADO'})")
+        click.echo(f"• SANs:         {', '.join(pki.get_certificate_sans(cert))}")
+
+    # Consulta replicacao no Postgres
+    click.echo("\n[Status PostgreSQL]:")
+    if role == "PRIMARY":
+        subprocess.run([
+            "gosu", "postgres", "psql", "-x", "-c",
+            "SELECT client_addr, state, sync_state, replay_lag FROM pg_stat_replication;"
+        ])
+    else:
+        subprocess.run([
+            "gosu", "postgres", "psql", "-x", "-c",
+            "SELECT status, sender_host, sender_port FROM pg_stat_wal_receiver;"
+        ])
+
+
+# =========================================================================
+# 7. CERTS INSPECT & RESCUE
 # =========================================================================
 @cli.group("certs")
 def certs_group():
-    """Inspecao e gerenciamento do ciclo de vida de certificados X.509."""
+    """Inspecao e ferramentas de certificados X.509."""
     pass
 
 
 @certs_group.command("inspect")
 @click.argument("cert_file")
 def inspect_cert(cert_file):
-    """Exibe informacoes detalhadas e validade de um arquivo de certificado."""
+    """Exibe informacoes detalhadas de um certificado."""
     path = Path(cert_file).expanduser().resolve()
     if not path.is_file():
         raise click.ClickException(f"Arquivo nao encontrado: {path}")
@@ -335,21 +734,13 @@ def inspect_cert(cert_file):
     click.echo(f"• Subject:     {cert.subject.rfc4514_string()}")
     click.echo(f"• Issuer:      {cert.issuer.rfc4514_string()}")
     click.echo(f"• Serial:      {cert.serial_number}")
-    click.echo(f"• Válido de:   {cert.not_valid_before_utc}")
-    click.echo(f"• Válido até:  {cert.not_valid_after_utc}")
-    click.echo(f"• Dias rest.:  {days} dias ({'VÁLIDO' if days > 0 else 'EXPIRADO'})")
-
-    try:
-        from cryptography.x509.oid import ExtensionOID
-        san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
-        san_list = [f"{type(n).__name__}:{n.value}" for n in san]
-        click.echo(f"• SANs:        {', '.join(san_list)}")
-    except Exception as e:
-        click.echo(f"• SANs:        (erro: {e})")
+    click.echo(f"• Valido de:   {cert.not_valid_before_utc}")
+    click.echo(f"• Valido ate:  {cert.not_valid_after_utc}")
+    click.echo(f"• Dias rest.:  {days} dias ({'VALIDO' if days > 0 else 'EXPIRADO'})")
+    click.echo(f"• SANs:        {', '.join(pki.get_certificate_sans(cert))}")
 
 
-# Conecta subcomandos promote e rescue existentes na CLI unificada
-cli.add_command(promote_cmd, name="promote")
+# Adiciona rescue
 cli.add_command(rescue_cmd, name="rescue")
 
 

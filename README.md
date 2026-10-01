@@ -1,6 +1,8 @@
 # Vault — Manual de Arquitetura, Segurança e Operação Técnica
 
-Cofre corporativo de segredos (*Secrets Manager appliance*) com criptografia de envelope (Envelope Encryption), banco de dados transacional embutido com suporte a replicação síncrona/assíncrona, motor de PKI interna (X.509 / mTLS mútuo), controle de acesso granular baseado em papéis (RBAC/ACL) e trilha de auditoria imutável.
+Cofre corporativo de segredos (*Secrets Manager appliance*) operando sob o modelo de governança e ciclo de vida do **CyberArk Conjur (`evoke`)**.
+
+Possui arquitetura de criptografia de envelope (Envelope Encryption), banco de dados transacional embutido com suporte a replicação síncrona/assíncrona, motor de PKI interna (X.509 / mTLS mútuo com certificado único de cluster), controle de acesso granular baseado em papéis (RBAC/ACL) e trilha de auditoria imutável.
 
 ---
 
@@ -9,45 +11,43 @@ Cofre corporativo de segredos (*Secrets Manager appliance*) com criptografia de 
 1. [Visão Geral e Arquitetura do Sistema](#1-visão-geral-e-arquitetura-do-sistema)
    - [Envelope Encryption (KEK e DEK)](#envelope-encryption-kek-e-dek)
    - [Identidades de Serviço (App IDs) e Sessões JWT](#identidades-de-serviço-app-ids-e-sessões-jwt)
-   - [Modelo de Cofres lógicos e RBAC](#modelo-de-cofres-lógicos-e-rbac)
-2. [Topologia de Rede e Segurança Zero-Trust](#2-topologia-de-rede-e-segurança-zero-trust)
+   - [Modelo de Cofres Lógicos e RBAC](#modelo-de-cofres-lógicos-e-rbac)
+2. [O Modelo Operacional Conjur (evoke)](#2-o-modelo-operacional-conjur-evoke)
+   - [Estados do Container: Unconfigured vs Configured](#estados-do-container-unconfigured-vs-configured)
+   - [Certificado Único de Cluster](#certificado-único-de-cluster)
+   - [Chaves Cifradas em Repouso (*.key.enc) e tmpfs](#chaves-cifradas-em-repouso-keyenc-e-tmpfs)
+3. [Topologia de Rede e Segurança Zero-Trust](#3-topologia-de-rede-e-segurança-zero-trust)
    - [Isolamento de Infraestrutura](#isolamento-de-infraestrutura)
    - [Proteção Ativa de Documentação (/docs, /openapi.json)](#proteção-ativa-de-documentação-docs-openapijson)
-   - [Princípio do Menor Privilégio no PostgreSQL](#princípio-do-menor-privilégio-no-postgresql)
-3. [Versionamento Granular de Segredos](#3-versionamento-granular-de-segredos)
+   - [mTLS Estrito no PostgreSQL (clientcert=verify-full)](#mtls-estrito-no-postgresql-clientcertverify-full)
+4. [Versionamento Granular de Segredos](#4-versionamento-granular-de-segredos)
    - [Estrutura do Histórico Imutável](#estrutura-do-histórico-imutável)
    - [Consulta de Versões Específicas (?version=X)](#consulta-de-versões-específicas-versionx)
    - [Controles de Segurança do Parâmetro](#controles-de-segurança-do-parâmetro)
-4. [Alta Disponibilidade, DR e Replicação WAL](#4-alta-disponibilidade-dr-e-replicação-wal)
-   - [Papéis dos Nós (Primary vs Standby)](#papéis-dos-nós-primary-vs-standby)
-   - [Comportamento Read-Only e Código HTTP 421](#comportamento-read-only-e-código-http-421)
-   - [Escalabilidade Horizontal (N Standbys / Followers)](#escalabilidade-horizontal-n-standbys--followers)
-5. [Motor PKI Interno e mTLS Obrigatório](#5-motor-pki-interno-e-mtls-obrigatório)
-   - [Autoridade Certificadora Raiz (Root CA)](#autoridade-certificadora-raiz-root-ca)
-   - [Emissão de Certificados com SANs (IPs e DNS)](#emissão-de-certificados-com-sans-ips-e-dns)
-   - [mTLS Estrito no PostgreSQL (clientcert=verify-full)](#mtls-estrito-no-postgresql-clientcertverify-full)
-   - [Suporte a BYO-Cert (PKI Corporativa)](#suporte-a-byo-cert-pki-corporativa)
-6. [CLI Unificada (vaultctl)](#6-cli-unificada-vaultctl)
-   - [vaultctl init](#vaultctl-init)
+5. [Guia de Operação da CLI Unificada (vaultctl)](#5-guia-de-operação-da-cli-unificada-vaultctl)
+   - [vaultctl configure primary](#vaultctl-configure-primary)
    - [vaultctl seed standby](#vaultctl-seed-standby)
-   - [vaultctl join](#vaultctl-join)
-   - [vaultctl promote](#vaultctl-promote)
-   - [vaultctl rescue](#vaultctl-rescue)
+   - [vaultctl unpack seed](#vaultctl-unpack-seed)
+   - [vaultctl configure standby](#vaultctl-configure-standby)
+   - [vaultctl ca issue](#vaultctl-ca-issue)
+   - [vaultctl role promote](#vaultctl-role-promote)
+   - [vaultctl status](#vaultctl-status)
    - [vaultctl certs inspect](#vaultctl-certs-inspect)
-7. [Guia de Deploy Passo a Passo](#7-guia-de-deploy-passo-a-passo)
-   - [Deploy Rápido em Host Único (deploy.py)](#cenário-a-deploy-rápido-em-host-único-deploypy)
-   - [Deploy Multi-VPS com Seeds (Estilo Conjur)](#cenário-b-deploy-multi-vps-com-seeds-estilo-conjur)
-   - [Distribuição Offline (Air-Gapped)](#distribuição-offline-air-gapped)
-8. [Failover Manual e Proteção Anti-Split-Brain](#8-failover-manual-e-proteção-anti-split-brain)
-9. [Resgate de Emergência Offline (Break-Glass)](#9-resgate-de-emergência-offline-break-glass)
-10. [Referência Completa da API REST](#10-referência-completa-da-api-rest)
-11. [Dicionário de Códigos de Erro da Plataforma](#11-dicionário-de-códigos-de-erro-da-plataforma)
+   - [vaultctl rescue](#vaultctl-rescue)
+6. [Fluxo de Deploy Multi-Máquina (Passo a Passo)](#6-fluxo-de-deploy-multi-máquina-passo-a-passo)
+   - [Passo 1: Inicializar o Nó 1 (Líder / Primário)](#passo-1-inicializar-o-nó-1-líder--primário)
+   - [Passo 2: Gerar Seed e Enviar ao Nó 2 (Standby)](#passo-2-gerar-seed-e-enviar-ao-nó-2-standby)
+   - [Passo 3: Desempacotar e Conectar o Nó 2](#passo-3-desempacotar-e-conectar-o-nó-2)
+7. [Failover Manual com Trava Anti-Split-Brain](#7-failover-manual-com-trava-anti-split-brain)
+8. [Resgate de Emergência Offline (Break-Glass)](#8-resgate-de-emergência-offline-break-glass)
+9. [Referência Completa da API REST](#9-referência-completa-da-api-rest)
+10. [Dicionário de Códigos de Erro da Plataforma](#10-dicionário-de-códigos-de-erro-da-plataforma)
 
 ---
 
 ## 1. Visão Geral e Arquitetura do Sistema
 
-O Vault é um appliance autônomo projetado para proteger segredos de aplicações, senhas de banco de dados, chaves de API e certificados com segurança de nível bancário.
+O Vault é empacotado como um appliance em container contendo a API FastAPI e o banco de dados PostgreSQL:
 
 ```text
  ┌──────────────────────────────────────────────────────────────┐
@@ -67,463 +67,354 @@ O Vault é um appliance autônomo projetado para proteger segredos de aplicaçõ
 ```
 
 ### Envelope Encryption (KEK e DEK)
-Para garantir que a chave mestra nunca precise ser exposta e que segredos individuais possam ser rotacionados independentemente:
-1. **Master Key (KEK — Key Encryption Key):**
-   - Chave simétrica de 256 bits gerada aleatoriamente no bootstrapping (`vaultctl init`).
-   - Carregada **exclusivamente na memória volátil** do processo (`MasterKeyHolder`).
-   - **Nunca** é gravada no banco de dados, **nunca** trafega pela API e **nunca** é impressa em logs.
-2. **DEK por Secret (Data Encryption Key):**
-   - Cada segredo e cada versão possuem uma DEK individual gerada aleatoriamente.
-   - O payload do segredo é cifrado com a DEK via **AES-256-GCM** (criptografia autenticada).
-   - A DEK é cifrada com a Master Key e persistida na coluna `encrypted_dek`.
-   - Atualizações (`PUT /secrets/{name}`) geram uma **nova DEK**, rotacionando a chave do segredo sem reescrever o restante do cofre.
+1. **Master Key (KEK — Key Encryption Key):** Chave de 256 bits entregue ao cofre via montagem `:ro` em `/run/secrets/master.key`. Fica carregada **exclusivamente na memória volátil** (`MasterKeyHolder`). Nunca vai para o disco em texto claro nem é impressa em logs.
+2. **DEK por Secret (Data Encryption Key):** Cada segredo e cada versão possuem uma chave DEK individual. O segredo é cifrado com a DEK via **AES-256-GCM**. A DEK é cifrada com a Master Key e persistida no banco. Atualizações rotacionam a DEK sem afetar outros segredos.
 
 ### Identidades de Serviço (App IDs) e Sessões JWT
-O cofre não autentica usuários humanos diretamente na API principal; autentica **identidades de serviço (App IDs)**:
-* **Credencial:** Identificador único (`app_name`) + segredo em alta entropia (`app_secret`), protegido por hash **bcrypt**.
-* **Origem Estrita:** Cada App ID é obrigatoriamente associado a um IP ou bloco CIDR permitido (`allowed_ip`).
-* **Sessão Efêmera:** A troca de credenciais em `POST /auth/token` emite um JWT assinado com chave interna de 256 bits, com TTL configurável (padrão: 15 minutos).
-* **Validação Contínua:** O IP de origem do cliente é verificado em **todas** as requisições subsequentes ao validar o token Bearer.
+* **Credencial:** Identificador (`app_name`) + segredo em alta entropia (`app_secret`), protegido por hash **bcrypt**.
+* **Origem Restrita:** Cada App ID é associado a um IP ou bloco CIDR permitido (`allowed_ip`).
+* **Sessão Efêmera:** `POST /auth/token` emite um JWT de curta duração (padrão: 15 minutos). O IP de origem do cliente é validado em todas as chamadas subsequentes com token Bearer.
 
-### Modelo de Cofres lógicos e RBAC
-Os recursos são organizados hierarquicamente:
-* **Vaults (Cofres):** Contêineres lógicos (ex.: `financeiro`, `infraestrutura`, `pagamentos`).
-* **Secrets (Segredos):** Registros identificados pelo caminho do cofre (ex.: `financeiro/db-password`).
-* **Permissões Granulares:**
-  - `create`: Permissão de provisionamento (global ou por cofre).
-  - `read`: Permissão de descriptografia e leitura do valor.
-  - `update`: Permissão de rotação de valor e DEK.
-  - `delete`: Permissão de expurgo do segredo e histórico.
+### Modelo de Cofres Lógicos e RBAC
+* **Vaults (Cofres):** Contêineres lógicos (ex.: `financeiro`, `infraestrutura`).
+* **Secrets (Segredos):** Registros associados ao cofre (ex.: `financeiro/db-password`).
+* **Permissões:** `create` (global ou no cofre), `read`, `update` e `delete` (por cofre ou individuais por secret).
 
 ---
 
-## 2. Topologia de Rede e Segurança Zero-Trust
+## 2. O Modelo Operacional Conjur (`evoke`)
 
-```text
-[ Aplicações Clientes ]                 [ Administrador ]
-       │                                        │
-       │ IP Autorizado + Bearer JWT             │ IP Autorizado do Admin
-       ▼                                        ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       VAULT ENGINE                           │
-│                                                              │
-│  • Bloqueio de IP fora da whitelist (403 Forbidden)         │
-│  • Swagger (/docs, /openapi.json) exclusivo do admin (404)   │
-│  • Prevenção contra spoofing de cabeçalhos proxy             │
-│  • PostgreSQL restrito a localhost + mTLS com certificados   │
-└──────────────────────────────────────────────────────────────┘
-```
+O projeto segue rigorosamente o modelo operacional corporativo do CyberArk Conjur:
+
+### Estados do Container: Unconfigured vs Configured
+* O container é inicializado **sem configuração prévia** e não encerra se não houver banco configurado.
+* **Estado `unconfigured`:** O processo do container permanece vivo em espera passiva. PostgreSQL e Uvicorn ficam parados aguardando a CLI `vaultctl`.
+* **Estado `configured`:** Após a execução de `vaultctl configure primary` ou `vaultctl configure standby`, o arquivo de estado `$PGDATA/cluster.json` é gravado no volume e o container assume seu papel definitivo automaticamente.
+* **Compatibilidade Retroativa:** Volumes já inicializados em versões anteriores continuam iniciando normalmente sem reconfiguração.
+
+### Certificado Único de Cluster
+Assim como no Conjur Enterprise:
+* O nó Líder e todos os nós Standby **compartilham um único certificado de cluster** (`cluster.crt` e `cluster.key`).
+* O certificado possui ExtendedKeyUsage para **Server Authentication (`serverAuth`)** e **Client Authentication (`clientAuth`)**.
+* O mesmo certificado atende:
+  1. HTTPS da API REST (Uvicorn).
+  2. TLS do servidor PostgreSQL.
+  3. Cliente mTLS da replicação de banco de dados.
+* O nó Standby **herda** o certificado e a chave do Líder via pacote seed; `seed standby` **não** emite certificados individuais por nó.
+
+### Chaves Cifradas em Repouso (*.key.enc) e tmpfs
+* A chave privada do cluster (`cluster.key.enc`) e a chave da Root CA (`ca.key.enc`) ficam gravadas em repouso **sempre cifradas com a Master Key** (AES-256-GCM).
+* Durante o boot, as chaves são decifradas exclusivamente para a **memória volátil** (`tmpfs` em `/dev/shm/vault_tls`, permissão `0600`).
+* No encerramento do container, uma rotina de trap sobrescreve e limpa as chaves em memória (*shred*).
+* A `master.key` **nunca é incluída no pacote seed**. Ela é entregue à máquina de destino pelo administrador através de canal seguro e montada em `/run/secrets/master.key`.
+
+---
+
+## 3. Topologia de Rede e Segurança Zero-Trust
 
 ### Isolamento de Infraestrutura
-* Por padrão, a porta de banco de dados (`5432`) não escuta em interfaces públicas (`listen_addresses='localhost'`). A comunicação API ↔ Banco é estritamente via loopback interna do container.
-* Em topologias distribuídas (múltiplas VPSs), a porta do banco opera com **mTLS mandatório** e deve ser protegida por firewall/Security Group liberando tráfego exclusivamente para os IPs dos nós pares.
+* O PostgreSQL escuta em `localhost` para tráfego local da API.
+* Em nós primários, a comunicação de replicação externa exige **mTLS obrigatório**:
+  ```text
+  hostssl replication replicator all cert map=cluster_map clientcert=verify-full
+  ```
+* O arquivo `pg_ident.conf` mapeia o Common Name do certificado de cluster para o papel `replicator`. Não há senha padrão de replicação nem conexões em texto claro.
 
 ### Proteção Ativa de Documentação (/docs, /openapi.json)
-Para eliminar a superfície de ataque e evitar enumeração de rotas por agentes maliciosos:
-* As rotas `/docs`, `/redoc` e `/openapi.json` são interceptadas via middleware antes de qualquer processamento.
-* Apenas conexões com origem no IP ou CIDR autorizado para identidades administrativas ativas (`is_admin=True, active=True`) conseguem visualizar a documentação.
-* **Comportamento para IPs não autorizados:** A API responde com **`HTTP 404 Not Found`** (e não 403), mascarando completamente a existência dos endpoints Swagger/OpenAPI.
-* Pode ser fixado estaticamente via variável de ambiente: `DOCS_ALLOWED_IP=10.10.20.37/32`.
-
-### Princípio do Menor Privilégio no PostgreSQL
-* O usuário da aplicação (`vault`) opera como `NOSUPERUSER NOCREATEDB NOCREATEROLE`.
-* A cada inicialização, o container revoga permissões de superusuário caso existam.
-* A senha do banco é gerada aleatoriamente com 32 bytes de alta entropia (`secrets.token_urlsafe(32)`) armazenada em arquivo de permissão restrita `0600`.
+* As rotas `/docs`, `/redoc` e `/openapi.json` são protegidas por middleware.
+* Somente conexões originadas do IP ou CIDR autorizado para identidades admin (`is_admin=True, active=True`) conseguem acessar o Swagger UI e o schema OpenAPI.
+* **IPs não autorizados recebem `HTTP 404 Not Found`**, mascarando a existência da documentação para scanners de vulnerabilidade externos.
 
 ---
 
-## 3. Versionamento Granular de Segredos
+## 4. Versionamento Granular de Segredos
 
-O Vault implementa versionamento imutável de segredos, preservando o histórico de alterações para auditoria, rastreabilidade e rollback.
+O Vault mantém um histórico imutável na tabela `secret_versions`:
 
 ```text
-Tabela secrets (Último estado)
-└── id, name, vault_id, version=3, encrypted_dek, ciphertext
-
-Tabela secret_versions (Histórico completo)
-├── version=1 | dek_v1 | ciphertext_v1 | created_by | timestamp
-├── version=2 | dek_v2 | ciphertext_v2 | created_by | timestamp
-└── version=3 | dek_v3 | ciphertext_v3 | created_by | timestamp
+POST /secrets (versão 1 criada)
+PUT /secrets  (versão 2 criada, nova DEK gerada)
+PUT /secrets  (versão 3 criada, nova DEK gerada)
 ```
 
-### Estrutura do Histórico Imutável
-* Ao criar um segredo (`POST /secrets`), a versão `1` é registrada.
-* Ao atualizar um segredo (`PUT /secrets/{name}`):
-  1. Uma nova chave de dados (DEK) é gerada.
-  2. O novo valor é cifrado e a DEK é selada com a Master Key.
-  3. O contador `version` é incrementado (`1 → 2 → 3`).
-  4. Um registro imutável é inserido na tabela `secret_versions`.
-* Ao excluir o segredo (`DELETE /secrets/{name}`), todas as versões históricas são expurgadas em cascata (`CASCADE`).
-
 ### Consulta de Versões Específicas (?version=X)
-* **Sem parâmetro (padrão):** Retorna imediatamente a última versão ativa:
+* **Consulta da versão atual:**
   ```http
   GET /secrets/financeiro/db-password
+  Authorization: Bearer <TOKEN>
   ```
-* **Com parâmetro de versão:** Recupera uma versão histórica específica:
+* **Consulta de versão histórica específica:**
   ```http
   GET /secrets/financeiro/db-password?version=2
+  Authorization: Bearer <TOKEN>
   ```
 
 ### Controles de Segurança do Parâmetro
-1. **Validação de Limites Rígidos:** O parâmetro é validado na camada HTTP com `ge=1` e `le=2147483647` (máximo suportado por inteiros de 32 bits no PostgreSQL), prevenindo erros de estouro de memória ou injeções.
-2. **Fail-Closed RBAC:** A verificação de permissão de leitura ocorre **antes** de checar a existência da versão. Um App ID não autorizado recebe `403` sem conseguir discernir quais versões existem.
-3. **Isolamento Anti-IDOR:** A consulta histórica amarra obrigatoriamente o UUID do secret:
-   ```python
-   filter(SecretVersion.secret_id == secret.id, SecretVersion.version == version)
-   ```
-4. **Auditoria por Versão:** A trilha de auditoria registra explicitamente a versão recuperada no campo de detalhe (`detail="version=2"`).
-
----
-
-## 4. Alta Disponibilidade, DR e Replicação WAL
-
-O Vault suporta arquiteturas com Disaster Recovery (DR) ativo e escalabilidade de leitura com N réplicas Standby conectadas a um nó Líder (Primário).
-
-```text
-                           [ Nó Primário (Líder) ]
-                         (Escrita & Leitura - :8000)
-                                      │
-            ┌─────────────────────────┴─────────────────────────┐
-    Streaming WAL (mTLS)                        Streaming WAL (mTLS)
-            ▼                                           ▼
-  [ Standby 1 (DR Local) ]                    [ Standby 2 (Cloud / Edge) ]
-(Somente Leitura - HTTP 421)                 (Somente Leitura - HTTP 421)
-```
-
-### Papéis dos Nós (Primary vs Standby)
-A rota pública `GET /health` identifica dinamicamente o papel operacional do nó:
-* **Nó Primário:**
-  ```json
-  {"status": "ok", "role": "primary", "read_only": false}
+* **Validação de Limites Rígidos:** `ge=1` e `le=2147483647` (evita estouro do tipo `INTEGER` no PostgreSQL).
+* **Fail-Closed RBAC:** O acesso é validado antes da consulta de versão. Clientes não autorizados recebem `403` sem conseguir descobrir quais versões existem.
+* **Isolamento Anti-IDOR:** A consulta histórica é amarrada ao UUID interno do secret:
+  ```python
+  filter(SecretVersion.secret_id == secret.id, SecretVersion.version == version)
   ```
-* **Nó Standby (DR):**
-  ```json
-  {"status": "ok", "role": "standby", "read_only": true}
-  ```
-
-### Comportamento Read-Only e Código HTTP 421
-* **Leituras Permitidas:** Aplicações podem emitir tokens (`POST /auth/token`) e consultar segredos (`GET /secrets/{name}`) diretamente em qualquer nó Standby, permitindo distribuir a carga de leitura geograficamente.
-* **Escritas Rejeitadas:** Tentativas de escrita (`POST /secrets`, `PUT`, `DELETE`, `/vaults`, `/admin`) em nós Standby são interceptadas no middleware e rejeitadas com **`HTTP 421 Misdirected Request`** (`VLT-5001`), orientando o cliente ou Load Balancer a direcionar a requisição ao Primário.
-
-### Escalabilidade Horizontal (N Standbys / Followers)
-O motor PostgreSQL suporta múltiplos receptores de WAL concorrentes (`max_wal_senders`). Cada nó Standby replica de forma autônoma sem interferir nos demais.
+* **Auditoria Forense:** O evento de auditoria grava explicitamente a versão recuperada (`detail="version=2"`).
 
 ---
 
-## 5. Motor PKI Interno e mTLS Obrigatório
+## 5. Guia de Operação da CLI Unificada (`vaultctl`)
 
-Para comunicação segura entre nós distribuídos (inclusive através de redes públicas ou clouds distintas), o Vault embarca um motor completo de PKI X.509 (`vault/pki.py`).
+A ferramenta `vaultctl` é o ponto único de controle do appliance:
 
-### Autoridade Certificadora Raiz (Root CA)
-* Chave RSA de 4096 bits autoassinada com extensões X.509 v3 (`basicConstraints=critical,CA:TRUE`, `keyCertSign`, `cRLSign`).
-* Emitida automaticamente na inicialização (`vaultctl init`) ou carregada via PKI externa.
-
-### Emissão de Certificados com SANs (IPs e DNS)
-* Os certificados de nó contêm Subject Alternative Names (SANs) cobrindo tanto IPs quanto hostnames DNS (ex.: `127.0.0.1`, `10.10.20.10`, `vault-primary`, `vault.empresa.local`).
-* Configurados com `extendedKeyUsage = serverAuth, clientAuth` para autenticação mútua bidirecional.
-
-### mTLS Estrito no PostgreSQL (clientcert=verify-full)
-A replicação de banco entre servidores exige certificados de cliente válidos assinados pela Root CA:
-```text
-hostssl replication replicator all cert clientcert=verify-full
-```
-* O nó Standby apresenta o certificado emitido para o usuário `CN=replicator`.
-* Conexões sem SSL ou com certificados desconhecidos são **bloqueadas no handshake TLS**.
-
-### Suporte a BYO-Cert (PKI Corporativa)
-Empresas que utilizam Autoridades Certificadoras corporativas (Microsoft AD CS, DigiCert, Venafi, Let's Encrypt) podem injetar seus próprios certificados no bootstrapping:
+### `vaultctl configure primary`
+Configura o container como Líder (Primário).
 ```bash
-vaultctl init --ca-cert /path/ca.crt --server-cert /path/server.crt --server-key /path/server.key
+docker exec -it vault vaultctl configure primary \
+    --hostname vault.exemplo.com \
+    --altname vault1.exemplo.com \
+    --altname vault2.exemplo.com \
+    --altname 10.10.20.10 \
+    --altname 10.10.20.20 \
+    --admin-ip 10.10.20.37/32
 ```
-
----
-
-## 6. CLI Unificada (`vaultctl`)
-
-A ferramenta de linha de comando `vaultctl` consolida todo o ciclo de vida operacional:
-
-### `vaultctl init`
-Inicializa as tabelas, configura o admin inicial, gera a `master.key` e emite os certificados da PKI interna:
-```bash
-vaultctl init \
-  --admin-name admin \
-  --admin-ip 10.10.20.37/32 \
-  --output-dir ./vault-init-output \
-  --node-san 10.10.20.10 \
-  --node-san vault-primary
-```
+* **Modo BYO (Bring-Your-Own-Cert):** Passe `--cert /path/cluster.crt --key /path/cluster.key --ca /path/ca.crt`. O Vault valida automaticamente formato PEM, correspondência de chaves, cadeia X.509, cobertura de SANs e EKU `serverAuth+clientAuth`.
 
 ### `vaultctl seed standby`
-Executado no nó Primário para emitir credenciais e certificados mTLS sob medida para uma réplica remota:
+Gera o pacote `.seed.tar` protegido para inicializar uma nova réplica Standby:
 ```bash
-vaultctl seed standby 10.10.20.20 \
-  --name vault-standby-1 \
-  --primary-host 10.10.20.10 \
-  --output ./node2.seed.tar
+docker exec vault vaultctl seed standby vault2.exemplo.com --primary-host vault1.exemplo.com > standby.seed.tar
 ```
-*Gera um pacote tar protegido contendo a `master.key`, o `ca.crt`, o par de chaves do nó Standby, o certificado de cliente do `replicator` e os metadados de conexão.*
+*Contém certificados públicos, chaves privadas cifradas com a master key e metadados de replicação. A `master.key` **não** é incluída.*
 
-### `vaultctl join`
-Executado na VPS de destino para desempacotar o seed e configurar a conexão mTLS com o Líder:
+### `vaultctl unpack seed`
+Desempacota e valida o seed na máquina réplica (aceita arquivo ou stdin `-`):
 ```bash
-vaultctl join --seed ./node2.seed.tar --output-dir ./vault-config
+docker exec -i vault vaultctl unpack seed - < standby.seed.tar
 ```
 
-### `vaultctl promote`
-Promove um nó Standby para Líder de escrita com checagem anti-split-brain:
+### `vaultctl configure standby`
+Sincroniza o banco inicial via `pg_basebackup -R` com mTLS `verify-full` e inicia o streaming:
 ```bash
-vaultctl promote
-# Forçar promoção em caso de isolamento de rede:
-vaultctl promote --force
+docker exec vault vaultctl configure standby
 ```
 
-### `vaultctl rescue`
-Executa extração forense de emergência (Break-Glass) diretamente da base de dados física:
+### `vaultctl ca issue`
+Reemite o certificado único de cluster adicionando novos SANs para novos nós:
 ```bash
-vaultctl rescue --master-key ./master.key --output segredos.json
+docker exec -it vault vaultctl ca issue --force vault3.exemplo.com 10.10.30.30
+```
+*Após reemitir o certificado, regenere os seeds dos nós e redistribua.*
+
+### `vaultctl role promote`
+Promove um nó Standby para Líder de escrita com verificação anti-split-brain via HTTPS:
+```bash
+docker exec -it vault vaultctl role promote
+# Em caso de nó primário comprovadamente isolado:
+docker exec -it vault vaultctl role promote --force
+```
+
+### `vaultctl status`
+Exibe o papel do nó, FQDN, validade do certificado e status da replicação PostgreSQL:
+```bash
+docker exec -it vault vaultctl status
 ```
 
 ### `vaultctl certs inspect`
-Inspeciona emissores, prazos de validade e SANs de qualquer certificado X.509:
+Inspeciona dados detalhados e validade de qualquer arquivo de certificado:
 ```bash
-vaultctl certs inspect ./vault-init-output/tls/server.crt
+docker exec -it vault vaultctl certs inspect /var/lib/postgresql/data/tls/cluster.crt
+```
+
+### `vaultctl rescue`
+Extrai segredos diretamente da base física em modo de emergência:
+```bash
+docker exec -it vault vaultctl rescue --master-key /run/secrets/master.key --output segredos.json
 ```
 
 ---
 
-## 7. Guia de Deploy Passo a Passo
+## 6. Fluxo de Deploy Multi-Máquina (Passo a Passo)
 
-### Cenário A: Deploy Rápido em Host Único (`deploy.py`)
-
-Ideal para desenvolvimento, testes locais ou appliances de nó único:
-
-```bash
-# 1. Execute o wizard interativo
-python deploy.py
-
-# 2. Parâmetros solicitados no terminal:
-#    • Cluster com DR: s ou n
-#    • Portas locais: ex: 8001 (Primário) e 8002 (Standby)
-#    • IP permitido para o admin: ex: 10.10.20.37/32
-#    • Senha mestra do admin
-```
-*O script detecta automaticamente portas livres no host, pula compilações se a imagem já existir e inicializa os containers.*
-
----
-
-### Cenário B: Deploy Multi-VPS com Seeds (Estilo Conjur)
-
-Para produção corporativa com isolamento físico real em VPSs ou nuvens separadas:
+Demonstração prática de implantação em duas máquinas separadas (Líder em `10.10.20.10` e Standby em `10.10.20.20`).
 
 ```text
-[ VPS 1: 10.10.20.10 ]                      [ VPS 2: 10.10.20.20 ]
-  (Primário Líder)                           (Standby DR Réplica)
-         │                                              │
-  1. vaultctl init                                      │
-  2. vaultctl seed standby 10.10.20.20                  │
-         │                                              │
-         └─── scp node2.seed.tar ──────────────────────>│
-                                                        │
-                                                 3. vaultctl join --seed
-                                                 4. docker run (Standby)
+  [ NÓ 1 - 10.10.20.10 ]                                   [ NÓ 2 - 10.10.20.20 ]
+            │                                                         │
+ 1. docker run (inicia unconfigured)                       1. docker run (inicia unconfigured)
+ 2. vaultctl configure primary                                        │
+            │                                                         │
+ 3. vaultctl seed standby 10.10.20.20 ──── Pipe SSH ─────────────────>│
+                                                           2. vaultctl unpack seed -
+                                                           3. vaultctl configure standby
+                                                                      │
+                                                           4. mTLS WAL Streaming Ativo!
 ```
 
-#### Passo 1: Na VPS Primária (`10.10.20.10`)
-1. Inicialize o nó Líder:
-   ```bash
-   sudo docker run -d --name vault-primary \
-     -p 8000:8000 \
-     -p 5432:5432 \
-     -v vault-primary-data:/var/lib/postgresql/data \
-     vault
-   ```
-2. Execute a inicialização via `vaultctl`:
-   ```bash
-   sudo docker exec -it vault-primary vaultctl init \
-     --admin-name admin \
-     --admin-ip 10.10.20.0/24 \
-     --node-san 10.10.20.10 \
-     --output-dir /run/secrets/bootstrap
-   ```
-3. Gere o seed para a VPS 2:
-   ```bash
-   sudo docker exec -it vault-primary vaultctl seed standby 10.10.20.20 \
-     --primary-host 10.10.20.10 \
-     --key /run/secrets/bootstrap/master.key \
-     --tls-dir /run/secrets/bootstrap/tls \
-     --output /tmp/node2.seed.tar
+### Passo 1: Inicializar o Nó 1 (Líder / Primário)
 
-   sudo docker cp vault-primary:/tmp/node2.seed.tar ./node2.seed.tar
+1. Crie a `master.key` (ou utilize uma chave de 32 bytes em base64):
+   ```bash
+   mkdir -p ./secrets
+   python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())" > ./secrets/master.key
+   chmod 600 ./secrets/master.key
+   ```
+2. Inicie o container (ele ficará em espera `unconfigured`):
+   ```bash
+   docker run -d --name vault \
+       -p 8000:8000 \
+       -p 5432:5432 \
+       -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
+       -v vault-data:/var/lib/postgresql/data \
+       vault:latest
+   ```
+3. Configure o Líder:
+   ```bash
+   docker exec -it vault vaultctl configure primary \
+       --hostname vault.empresa.local \
+       --altname vault1.empresa.local \
+       --altname vault2.empresa.local \
+       --altname 10.10.20.10 \
+       --altname 10.10.20.20 \
+       --admin-ip 10.10.20.0/24
    ```
 
-#### Passo 2: Transferência Segura
-Transfira o seed para a segunda máquina:
+### Passo 2: Gerar Seed e Enviar ao Nó 2 (Standby)
+
+Na máquina 2, inicie o container com a **mesma master key** (entregue por canal seguro):
 ```bash
-scp node2.seed.tar k8s@10.10.20.20:~/Vault/
+# Na Máquina 2:
+docker run -d --name vault \
+    -p 8000:8000 \
+    -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
+    -v vault-data:/var/lib/postgresql/data \
+    vault:latest
 ```
 
-#### Passo 3: Na VPS Standby (`10.10.20.20`)
-1. Desempacote as configurações:
-   ```bash
-   python3 -m cli.vaultctl join --seed node2.seed.tar --output-dir ~/Vault/config
-   ```
-2. Inicialize o container Standby:
-   ```bash
-   sudo docker run -d --name vault-dr \
-     -p 8000:8000 \
-     -e REPLICATION_ROLE=standby \
-     -e PRIMARY_HOST=10.10.20.10 \
-     -e PRIMARY_PORT=5432 \
-     --mount type=bind,source=/home/k8s/Vault/config/master.key,target=/run/secrets/master.key,readonly \
-     --mount type=bind,source=/home/k8s/Vault/config/tls,target=/run/secrets/tls,readonly \
-     -v vault-dr-data:/var/lib/postgresql/data \
-     vault
-   ```
-
----
-
-### Distribuição Offline (Air-Gapped)
-
-Para servidores sem acesso à internet externa:
-
-1. **Na máquina de build (com internet):**
-   ```bash
-   docker build -t vault:latest .
-   docker save -o vault.tar vault:latest
-   ```
-2. **Copia para o servidor:**
-   ```bash
-   scp vault.tar deploy.py usuario@servidor:~/
-   ```
-3. **No servidor de destino:**
-   ```bash
-   docker load -i vault.tar
-   python3 deploy.py
-   ```
-
----
-
-## 8. Failover Manual e Proteção Anti-Split-Brain
-
-Para evitar a partição de dados (*Split-Brain*) decorrente de dois nós acreditando serem masters em clusters de 2 nós:
-
-```text
-[ Operador executa Promoção ]
-              │
-              ▼
- Checagem Ativa: O Líder antigo ainda está respondendo?
-       ├── SIM ──> [ BLOQUEADO - VLT-5003 ] Exige desligamento manual prévio.
-       └── NÃO ──> [ PROMOÇÃO CONCLUÍDA ] O nó Standby assume escrita.
+Na Máquina 1, gere o seed e envie via pipe SSH diretamente para o container do Nó 2:
+```bash
+# Na Máquina 1:
+docker exec vault vaultctl seed standby 10.10.20.20 --primary-host 10.10.20.10 | \
+    ssh usuario@10.10.20.20 "docker exec -i vault vaultctl unpack seed -"
 ```
 
-1. **Desligue o nó Primário anterior:**
-   ```bash
-   docker stop vault-primary
-   ```
-2. **Promova o nó Standby:**
-   - **Pelo Host:**
-     ```bash
-     python deploy.py --promote vault-dr
-     ```
-   - **De dentro do Container:**
-     ```bash
-     docker exec -it vault-dr vaultctl promote
-     ```
-3. O status em `GET /health` converte-se instantaneamente para `{"role": "primary", "read_only": false}`.
+### Passo 3: Desempacotar e Conectar o Nó 2
+
+Na Máquina 2, execute a configuração do Standby (nenhuma flag necessária; todos os parâmetros e certificados mTLS são herdados do seed):
+```bash
+# Na Máquina 2:
+docker exec vault vaultctl configure standby
+```
+
+Pronto! O nó 2 executará o `pg_basebackup` via mTLS com o nó 1 e passará a receber o streaming de WAL em tempo real.
 
 ---
 
-## 9. Resgate de Emergência Offline (Break-Glass)
+## 7. Failover Manual com Trava Anti-Split-Brain
 
-Garante acesso aos segredos mesmo se a API web for corrompida, travar ou for acidentalmente desinstalada.
+Para promover um nó Standby com segurança:
+
+1. **Desligue o container do Líder anterior:**
+   ```bash
+   docker stop vault
+   ```
+2. **Execute a promoção no Standby:**
+   ```bash
+   docker exec -it vault vaultctl role promote
+   ```
+   *O comando executa checagem ativa contra o endpoint HTTPS do primário. Se o primário ainda estiver online e respondendo como master, a promoção é rejeitada (`VLT-5003`). Se o primário estiver desligado, a réplica assume a escrita (`role: primary`).*
+
+---
+
+## 8. Resgate de Emergência Offline (Break-Glass)
+
+Caso a aplicação esteja quebrada ou indisponível, os segredos podem ser extraídos diretamente da base bruta:
 
 ```bash
-# Extração em tela:
-python deploy.py --rescue --key ./vault-init-output/master.key --volume vault-primary-data
-
-# Exportação para arquivo JSON estruturado:
-python deploy.py --rescue --key ./vault-init-output/master.key --volume vault-primary-data --output segredos.json
+./scripts/rescue.sh --key ./secrets/master.key --volume vault-data --output segredos.json
 ```
 
-* **Com container online:** Executa extração em memória sem paradas.
-* **Com container offline:** Sobe um container efêmero isolado (`--network none`), repara WALs se necessário via `pg_resetwal`, lê os dados utilizando a `master.key` e desliga imediatamente.
+Ou diretamente via Docker isolado da rede:
+```bash
+docker run --rm \
+    -v vault-data:/var/lib/postgresql/data \
+    --mount type=bind,source=$(pwd)/secrets/master.key,target=/run/secrets/master.key,readonly \
+    --network none \
+    --entrypoint bash \
+    vault:latest -c "
+      export PATH=\$(pg_config --bindir):\$PATH
+      chown -R postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data
+      rm -f /var/lib/postgresql/data/postmaster.pid
+      export POSTGRES_PASSWORD=\$(cat /var/lib/postgresql/data/.db_password)
+      export DATABASE_URL=postgresql+psycopg2://vault:\$POSTGRES_PASSWORD@localhost:5432/vault
+      gosu postgres pg_ctl -D /var/lib/postgresql/data -o '-c listen_addresses=localhost' -w start
+      vaultctl rescue --master-key /run/secrets/master.key --format json
+      gosu postgres pg_ctl -D /var/lib/postgresql/data -m fast -w stop
+    " > segredos.json
+```
 
 ---
 
-## 10. Referência Completa da API REST
+## 9. Referência Completa da API REST
 
 ### Autenticação & Sessão
 
 #### `POST /auth/token`
-Autentica uma integração via `app_name` e `app_secret`. Revalida a whitelist de IP do App ID.
+Troca credenciais de App ID por um token JWT Bearer.
+```json
+// Request
+{"app_name": "app-pagamentos", "app_secret": "chave-secreta"}
 
-* **Corpo:**
-  ```json
-  {"app_name": "app-backend", "app_secret": "chave-secreta"}
-  ```
-* **Resposta (`200 OK`):**
-  ```json
-  {"access_token": "eyJhbGci...", "token_type": "bearer", "expires_in": 900}
-  ```
+// Response (200 OK)
+{"access_token": "eyJhbGciOi...", "token_type": "bearer", "expires_in": 900}
+```
 
 ---
 
 ### Gestão de Segredos
 
 #### `POST /secrets`
-Cria um segredo no cofre indicado no path.
+Cria um segredo no cofre indicado no nome.
+```json
+// Request
+{
+  "name": "financeiro/chave-pix",
+  "value": "meu-segredo-super-protegido",
+  "permissions": [
+    {"app_name": "app-faturamento", "permissions": ["read"]}
+  ]
+}
 
-* **Headers:** `Authorization: Bearer <JWT>`
-* **Corpo:**
-  ```json
-  {
-    "name": "financeiro/chave-pix",
-    "value": "valor-secreto-super-protegido",
-    "permissions": [
-      {"app_name": "app-pagamentos", "permissions": ["read"]}
-    ]
-  }
-  ```
-* **Resposta (`201 Created`):**
-  ```json
-  {"id": "c3a1b2d4-...", "name": "financeiro/chave-pix", "version": 1}
-  ```
+// Response (201 Created)
+{"id": "a1b2c3d4-...", "name": "financeiro/chave-pix", "version": 1}
+```
 
 #### `GET /secrets/{name}`
 Recupera o valor descriptografado de um segredo. Suporta busca por versão histórica.
-
-* **Query Parameters:**
-  - `version` (inteiro opcional, `1` a `2147483647`): Versão específica desejada.
-* **Exemplo de busca por versão:**
-  ```http
-  GET /secrets/financeiro/chave-pix?version=2 HTTP/1.1
-  Authorization: Bearer <JWT>
-  ```
-* **Resposta (`200 OK`):**
-  ```json
-  {
-    "id": "c3a1b2d4-...",
-    "name": "financeiro/chave-pix",
-    "version": 2,
-    "value": "valor-secreto-super-protegido"
-  }
-  ```
+* **Query Parameters:** `version` (inteiro opcional, de `1` a `2147483647`).
+```http
+GET /secrets/financeiro/chave-pix?version=2
+Authorization: Bearer <TOKEN>
+```
+```json
+// Response (200 OK)
+{
+  "id": "a1b2c3d4-...",
+  "name": "financeiro/chave-pix",
+  "version": 2,
+  "value": "meu-segredo-super-protegido"
+}
+```
 
 #### `PUT /secrets/{name}`
-Rotaciona a DEK e atualiza o valor do segredo, incrementando a versão.
+Rotaciona a DEK e atualiza o valor do segredo, incrementando a versão e preservando histórico.
+```json
+// Request
+{"value": "novo-valor-do-segredo"}
 
-* **Corpo:**
-  ```json
-  {"value": "novo-valor-do-segredo"}
-  ```
-* **Resposta (`200 OK`):**
-  ```json
-  {"id": "c3a1b2d4-...", "name": "financeiro/chave-pix", "version": 3}
-  ```
+// Response (200 OK)
+{"id": "a1b2c3d4-...", "name": "financeiro/chave-pix", "version": 3}
+```
 
 #### `DELETE /secrets/{name}`
-Exclui permanentemente o segredo e todas as suas versões históricas. Resposta `204 No Content`.
+Exclui permanentemente o segredo e todas as suas versões históricas (`204 No Content`).
 
 ---
 
@@ -538,25 +429,25 @@ Exclui permanentemente o segredo e todas as suas versões históricas. Resposta 
 
 ---
 
-### Gestão Administrativa & Auditoria
+### Gestão Administrativa & Monitoramento
 
 | Método | Rota | Descrição |
 | :--- | :--- | :--- |
-| `POST` | `/admin/apps` | Cria uma nova identidade de serviço (App ID) |
-| `GET` | `/admin/apps` | Lista integrações cadastradas e seus IPs autorizados |
+| `POST` | `/admin/apps` | Registra nova identidade de serviço (App ID) com IP permitido |
+| `GET` | `/admin/apps` | Lista identidades de serviço cadastradas e seus IPs autorizados |
 | `GET` | `/admin/audit` | Consulta a trilha de auditoria com paginação e filtros |
-| `GET` | `/health` | Checagem de prontidão e papel do nó no cluster |
+| `GET` | `/health` | Checagem de prontidão e papel do nó no cluster (`role: primary` ou `role: standby`) |
 
 ---
 
-## 11. Dicionário de Códigos de Erro da Plataforma
+## 10. Dicionário de Códigos de Erro da Plataforma
 
-Todas as falhas estruturadas de negócio retornam formato padronizado:
+Todas as respostas de erro de negócio seguem o formato padronizado:
 ```json
 {
   "detail": {
     "error_code": "VLT-XXXX",
-    "message": "Descrição amigável da falha"
+    "message": "Descrição técnica do erro"
   }
 }
 ```
@@ -565,9 +456,14 @@ Todas as falhas estruturadas de negócio retornam formato padronizado:
 | :--- | :--- | :--- |
 | **VLT-1001** | Master key ausente no caminho especificado em `MASTER_KEY_FILE` | 500 / Abort |
 | **VLT-1002** | Master key inválida ou corrompida (tamanho incompatível com AES-256) | 500 / Abort |
-| **VLT-1003** | Falha ao conectar ou provisionar schema no PostgreSQL | 500 / Abort |
-| **VLT-1004** | Master key não confere com o verification blob salvo no banco | 500 / Abort |
-| **VLT-1006** | Tentativa de reinicializar banco existente sem a flag `--force` | 400 |
+| **VLT-1003** | Falha ao conectar ou inicializar banco PostgreSQL | 500 / Abort |
+| **VLT-1004** | Falha na verificação de integridade da master key (não decifra blob ou chaves) | 500 / Abort |
+| **VLT-1005** | Nó não configurado (execute `vaultctl configure primary` ou `configure standby`) | 500 / Abort |
+| **VLT-1006** | Nó já configurado (reconfiguração bloqueada para proteger o banco) | 400 |
+| **VLT-1007** | Pacote seed vazio, corrompido ou contendo `master.key` (violação de segurança) | 400 |
+| **VLT-1008** | Componente obrigatório ausente no seed (`cluster.crt`, `cluster.key.enc`, etc.) | 400 |
+| **VLT-1009** | Falha na validação de certificados BYO (chave incompatível, SAN ausente, EKU ou expirado) | 400 |
+| **VLT-1010** | Chave da CA ausente (`ca.key.enc`). Reemissão requer PKI corporativa externa | 400 |
 | **VLT-2001** | Credenciais inválidas no login (`app_name` ou `app_secret` incorreto) | 401 |
 | **VLT-2002** | IP do cliente fora da whitelist configurada no `allowed_ip` do App ID | 403 |
 | **VLT-2003** | Token JWT ausente, corrompido ou expirado | 401 |
