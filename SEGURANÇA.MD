@@ -98,6 +98,16 @@ Nome: 255 ou 512 caracteres
 Request body: limite global
 ```
 
+---
+
+## 12. Exposição de documentação e schema OpenAPI (`/docs`, `/redoc`, `/openapi.json`) [RESOLVIDO]
+
+**Status:** Implementado via middleware.
+- Rotas `/docs`, `/redoc` e `/openapi.json` são interceptadas antes de serem processadas.
+- Apenas conexões originadas do IP ou CIDR autorizado para usuários admin (`is_admin=True, active=True`) conseguem visualizar a documentação e o schema da API.
+- Qualquer requisição de IP não autorizado recebe **`404 Not Found`**, eliminando superfície de ataque, reconhecimento e enumeração por scanners externos.
+- Opcionalmente, pode ser fixado via variável de ambiente `DOCS_ALLOWED_IP`.
+
 # Prioridade sugerida
 
 1. Corrigir `trust_proxy`.

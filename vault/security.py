@@ -64,7 +64,7 @@ def extract_client_ip(request: Request, trust_proxy: bool) -> str:
         if forwarded:
             # primeiro IP da cadeia = cliente original
             return forwarded.split(",")[0].strip()
-    return request.client.host
+    return request.client.host if request.client else "127.0.0.1"
 
 
 def ip_allowed(client_ip: str, allowed_ip_or_cidr: str) -> bool:
