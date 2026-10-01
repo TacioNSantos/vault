@@ -44,7 +44,7 @@ Abordagens discutidas:
 1. **Cluster 2 nós com Failover Manual:** Para evitar o risco de *Split-Brain* inerente a 2 nós sem quorum de maioria, o nó DR atua como *Hot Standby* assíncrono via streaming WAL do PostgreSQL.
    - `GET /health` responde `role: primary` ou `role: standby`.
    - O nó standby aceita leituras e rejeita escritas com `HTTP 421 Misdirected Request` (`VLT-5001`).
-   - Promoção manual via `vault-promote` (dentro do container) ou `python deploy.py --promote` (fora do container).
+   - Promoção manual via `vaultctl role promote` (ou `vaultctl promote`).
    - **Trava Anti-Split-Brain:** O comando de promoção verifica ativamente se o nó primário ainda está online e respondendo como master. Se estiver, a promoção é rejeitada (`VLT-5003`) sem desligá-lo automaticamente, exigindo desligamento do primário antes de autorizar o DR a assumir.
 2. **Break-Glass Híbrido (Online & Offline):**
    - Se o container estiver **online**, a extração ocorre em tempo real via `docker exec` no processo ativo, evitando conflito com o arquivo de lock `postmaster.pid` do PostgreSQL.

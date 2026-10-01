@@ -62,7 +62,7 @@ ENABLE_APP_RENAME = os.environ.get("ENABLE_APP_RENAME", "false").lower() == "tru
 JWT_ALGORITHM = "HS256"
 
 # String de verificacao usada para confirmar que a master key fornecida
-# no boot eh a mesma usada no vault-init (sem isso, uma master key errada
+# no boot eh a mesma usada no configure primary (sem isso, uma master key errada
 # subiria o vault "funcionando" mas incapaz de decriptar nada).
 VERIFICATION_PLAINTEXT = b"VAULT_MASTER_KEY_OK"
 VERIFICATION_CONFIG_KEY = "master_key_verification_blob"

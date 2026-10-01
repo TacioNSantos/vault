@@ -2,7 +2,7 @@
 Envelope encryption.
 
 - Master Key (KEK): existe so em memoria, nunca tocamos disco com ela em claro
-  fora do momento do vault-init (onde vira um arquivo entregue ao admin).
+  fora do momento de criacao (onde vira um arquivo entregue ao admin).
 - Data Encryption Key (DEK): 1 por secret, gerada aleatoria, criptografada
   pela master key e guardada junto do secret no banco.
 - O valor do secret em si eh criptografado pela DEK, nao pela master key

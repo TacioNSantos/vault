@@ -191,7 +191,7 @@ if ! gosu postgres psql -d postgres -tAc "SELECT pg_is_in_recovery();" 2>/dev/nu
 fi
 
 if [ "${VAULT_INIT_ONLY:-0}" = "1" ]; then
-    echo "Postgres pronto para vault-init / administracao."
+    echo "Postgres pronto para administracao / operacoes internas."
     touch /tmp/postgres-ready
     exec sleep infinity
 fi
