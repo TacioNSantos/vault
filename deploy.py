@@ -424,15 +424,19 @@ def deploy_cluster(image: str = "vault", force_build: bool = False):
 
     ensure_image(image, force_build=force_build)
 
-    # Limpa containers anteriores com o mesmo nome se existirem parados ou em conflito
+    # Verifica se os containers já existem antes de prosseguir
     for c_name in (primary_name, dr_name):
         c_state = container_state(c_name)
-        if c_state is not None:
-            if c_state is True:
-                print(f"Container '{c_name}' já está em execução. Verifique com: docker logs {c_name}")
+        if c_state is True:
+            print(f"O container '{c_name}' já está em execução. Abortando deploy.")
+            print(f"Para verificar os logs: docker logs {c_name}")
+            return
+        if c_state is False:
+            if ask(f"O container '{c_name}' já existe (parado). Deseja removê-lo para recriar? (s/N)", "n").lower() != "s":
+                print(f"Operação cancelada. Remova o container manualmente com 'docker rm {c_name}' se desejar.")
                 return
-            print(f"Removendo container anterior parado '{c_name}'...")
-            run("rm", "-f", c_name, capture=True)
+            run("rm", c_name, capture=True)
+            print(f"Container '{c_name}' removido.")
 
     # Cria rede e volumes
     networks = run("network", "ls", "--format", "{{.Name}}", capture=True).splitlines()
