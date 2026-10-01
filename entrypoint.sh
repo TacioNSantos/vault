@@ -191,5 +191,6 @@ if [ -n "$TLS_DIR" ] && [ -f "$TLS_DIR/server.crt" ] && [ -f "$TLS_DIR/server.ke
 fi
 
 touch /tmp/postgres-ready
-echo "[VAULT] Inicializacao concluida. Iniciando API Web (role: $REPLICATION_ROLE)..."
-exec python -m uvicorn vault.main:app --host 0.0.0.0 --port 8000 "${UVICORN_SSL_ARGS[@]}"
+API_PORT="${API_PORT:-443}"
+echo "[VAULT] Inicializacao concluida. Iniciando API Web em https://0.0.0.0:$API_PORT (role: $REPLICATION_ROLE)..."
+exec python -m uvicorn vault.main:app --host 0.0.0.0 --port "$API_PORT" "${UVICORN_SSL_ARGS[@]}"

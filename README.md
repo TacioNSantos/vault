@@ -259,7 +259,7 @@ Demonstração prática de implantação em duas máquinas separadas (Líder em 
 2. Inicie o container (ele ficará em espera `unconfigured`):
    ```bash
    docker run -d --name vault \
-       -p 8000:8000 \
+       -p 443:443 \
        -p 5432:5432 \
        -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
        -v vault-data:/var/lib/postgresql/data \
@@ -282,7 +282,7 @@ Na máquina 2, inicie o container com a **mesma master key** (entregue por canal
 ```bash
 # Na Máquina 2:
 docker run -d --name vault \
-    -p 8000:8000 \
+    -p 443:443 \
     -v $(pwd)/secrets/master.key:/run/secrets/master.key:ro \
     -v vault-data:/var/lib/postgresql/data \
     vault:latest

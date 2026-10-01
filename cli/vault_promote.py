@@ -40,17 +40,23 @@ def get_primary_host(data_dir: str) -> str | None:
     return None
 
 
-def check_primary_is_active_master(primary_host: str, primary_port: int = 5432, primary_api_port: int = 8000) -> bool:
-    # 1. Checa a API /health do primario via HTTP
-    try:
-        url = f"http://{primary_host}:{primary_api_port}/health"
-        with urllib.request.urlopen(url, timeout=2) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode())
-                if data.get("role") == "primary":
-                    return True
-    except Exception:
-        pass
+def check_primary_is_active_master(primary_host: str, primary_port: int = 5432, primary_api_port: int = 443) -> bool:
+    # 1. Checa a API /health do primario via HTTPS / HTTP
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    for proto in ("https", "http"):
+        try:
+            url = f"{proto}://{primary_host}:{primary_api_port}/health"
+            with urllib.request.urlopen(url, timeout=2, context=ctx if proto == "https" else None) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode())
+                    if data.get("role") == "primary":
+                        return True
+        except Exception:
+            pass
 
     # 2. Checa diretamente o status do PostgreSQL do primario
     try:

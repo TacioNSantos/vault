@@ -94,10 +94,10 @@ fi
 
 # 7. Valida rota /health nos dois nós
 echo -e "\n[Passo 7] Verificando endpoints /health com TLS..."
-docker exec "$CONTAINER_N1" curl -ksf https://127.0.0.1:8000/health | grep -q '"role":"primary"'
+docker exec "$CONTAINER_N1" curl -ksf https://127.0.0.1:443/health | grep -q '"role":"primary"'
 echo "Node 1 respondeu como primary!"
 
-docker exec "$CONTAINER_N2" curl -ksf https://127.0.0.1:8000/health | grep -q '"role":"standby"'
+docker exec "$CONTAINER_N2" curl -ksf https://127.0.0.1:443/health | grep -q '"role":"standby"'
 echo "Node 2 respondeu como standby (read-only)!"
 
 # 8. Desliga Node 1 e promove Node 2 (Failover Anti-Split-Brain)
@@ -106,7 +106,7 @@ docker stop "$CONTAINER_N1"
 docker exec "$CONTAINER_N2" vaultctl role promote
 
 sleep 2
-docker exec "$CONTAINER_N2" curl -ksf https://127.0.0.1:8000/health | grep -q '"role":"primary"'
+docker exec "$CONTAINER_N2" curl -ksf https://127.0.0.1:443/health | grep -q '"role":"primary"'
 echo "Node 2 assumiu como novo Líder de escrita!"
 
 # 9. Promovido Node 2 gera seed para um terceiro nó

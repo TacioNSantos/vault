@@ -603,9 +603,11 @@ def execute_promotion(force: bool = False):
     primary_host = cluster_meta.get("primary_host")
     ca_crt_path = pgdata / "tls" / "ca.crt"
 
+    primary_api_port = cluster_meta.get("primary_api_port", int(os.environ.get("API_PORT", 443)))
+
     # Checagem ativa anti-split-brain via HTTPS seguro
     if primary_host and not force:
-        click.echo(f"Verificando status do lider anterior em https://{primary_host}:8000/health...")
+        click.echo(f"Verificando status do lider anterior em https://{primary_host}:{primary_api_port}/health...")
         ctx = ssl.create_default_context(cafile=str(ca_crt_path) if ca_crt_path.is_file() else None)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE if not ca_crt_path.is_file() else ssl.CERT_REQUIRED
@@ -613,7 +615,7 @@ def execute_promotion(force: bool = False):
         leader_active = False
         check_error = None
         try:
-            req = urllib.request.Request(f"https://{primary_host}:8000/health")
+            req = urllib.request.Request(f"https://{primary_host}:{primary_api_port}/health")
             with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode())
