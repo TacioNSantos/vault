@@ -104,6 +104,25 @@ class Secret(Base):
 
     permissions = relationship("SecretPermission", back_populates="secret", cascade="all, delete-orphan")
     vault = relationship("Vault", back_populates="secrets")
+    versions = relationship("SecretVersion", back_populates="secret", cascade="all, delete-orphan", order_by="SecretVersion.version.desc()")
+
+
+class SecretVersion(Base):
+    """Historico de versoes de secrets."""
+    __tablename__ = "secret_versions"
+    __table_args__ = (UniqueConstraint("secret_id", "version", name="uq_secret_version"),)
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    secret_id = Column(UUID(as_uuid=False), ForeignKey("secrets.id", ondelete="CASCADE"), nullable=False)
+    version = Column(Integer, nullable=False)
+
+    encrypted_dek = Column(LargeBinary, nullable=False)   # DEK criptografada pela master key
+    ciphertext = Column(LargeBinary, nullable=False)      # valor do secret criptografado pela DEK
+
+    created_by = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.now(datetime.UTC))
+
+    secret = relationship("Secret", back_populates="versions")
 
 
 class SecretPermission(Base):

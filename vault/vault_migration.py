@@ -3,14 +3,14 @@
 from sqlalchemy import inspect, text
 
 from vault.database import Base, SessionLocal, engine
-from vault.models import AuthRateLimit, Secret, Vault, VaultPermission
+from vault.models import AuthRateLimit, Secret, SecretVersion, Vault, VaultPermission
 from vault.vault_paths import legacy_vault_name
 
 
 def ensure_vaults():
     with engine.begin() as connection:
         Base.metadata.create_all(bind=connection, tables=[
-            Vault.__table__, VaultPermission.__table__, AuthRateLimit.__table__,
+            Vault.__table__, VaultPermission.__table__, AuthRateLimit.__table__, SecretVersion.__table__,
         ])
         # create_all nao adiciona indices a tabelas existentes.
         connection.execute(text(
@@ -18,6 +18,9 @@ def ensure_vaults():
         ))
         connection.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_audit_log_app_timestamp ON audit_log (app_id, timestamp)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_secret_versions_secret_id_version ON secret_versions (secret_id, version)"
         ))
         if "vault_id" not in {column["name"] for column in inspect(connection).get_columns("secrets")}:
             connection.execute(text("ALTER TABLE secrets ADD COLUMN vault_id UUID"))
@@ -36,6 +39,23 @@ def ensure_vaults():
                 db.add(vaults[name])
                 db.flush()
             secret.vault_id = vaults[name].id
+
+        # Backfill de versoes existentes na tabela secret_versions
+        for secret in db.query(Secret).all():
+            has_ver = db.query(SecretVersion).filter(
+                SecretVersion.secret_id == secret.id,
+                SecretVersion.version == secret.version,
+            ).first()
+            if not has_ver and secret.encrypted_dek and secret.ciphertext:
+                db.add(SecretVersion(
+                    secret_id=secret.id,
+                    version=secret.version,
+                    encrypted_dek=secret.encrypted_dek,
+                    ciphertext=secret.ciphertext,
+                    created_by=secret.created_by,
+                    created_at=secret.updated_at or secret.created_at,
+                ))
+
         db.commit()
     except Exception:
         db.rollback()

@@ -171,8 +171,8 @@ autenticado com `is_admin=true`.
 | `GET /vaults/{vault_name}/permissions` | Admin | — | `200`: grants do cofre, com nomes dos apps e listas de permissões |
 | `GET /vaults/{vault_name}/secrets` | App autenticado | — | `200`: `id`, `name`, `version` dos secrets que pode ler; admin vê todos |
 | `POST /secrets` | Admin, `"create"` global ou `"create"` no cofre | `name`, `value`; `permissions` opcional | `201`: `id`, `name`, `version` do secret; criador recebe read/update/delete |
-| `GET /secrets/{name}` | Admin ou app com `"read"` herdado/individual | — | `200`: `id`, `name`, `version`, **`value` em texto puro** |
-| `PUT /secrets/{name}` | Admin ou app com `"update"` herdado/individual | `{"value":"<novo valor>"}` | `200`: `id`, `name`, `version` incrementada; substitui o valor atual |
+| `GET /secrets/{name}` | Admin ou app com `"read"` herdado/individual | `version` (query opcional) | `200`: `id`, `name`, `version`, **`value` em texto puro** (atual ou versão específica) |
+| `PUT /secrets/{name}` | Admin ou app com `"update"` herdado/individual | `{"value":"<novo valor>"}` | `200`: `id`, `name`, `version` incrementada; cria nova versão no histórico |
 | `DELETE /secrets/{name}` | Admin ou app com `"delete"` herdado/individual | — | `204`: exclui o secret |
 | `POST /secrets/{name}/permissions` | Admin | `app_name`, `permissions` individuais | `204`: substitui o grant desse app somente nesse secret |
 | `GET /admin/audit` | Admin | Filtros por query string | `200`: `items`, `total`, `limit`, `offset`; detalhes abaixo |

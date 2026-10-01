@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from vault.database import get_db, is_database_in_recovery
-from vault.models import Secret, SecretPermission, AppIdentity, Vault
+from vault.models import Secret, SecretVersion, SecretPermission, AppIdentity, Vault
 from vault.schemas import SecretCreateRequest, SecretUpdateRequest, SecretOut, SecretValueOut, PermissionGrant
 from vault import security, crypto
 from vault.security import MasterKeyHolder
@@ -69,10 +69,20 @@ def create_secret(
         vault_id=vault.id,
         encrypted_dek=encrypted_dek,
         ciphertext=ciphertext,
+        version=1,
         created_by=app_identity.id,
     )
     db.add(secret)
     db.flush()  # pega o id gerado antes do commit
+
+    # armazena versao inicial no historico
+    db.add(SecretVersion(
+        secret_id=secret.id,
+        version=1,
+        encrypted_dek=encrypted_dek,
+        ciphertext=ciphertext,
+        created_by=app_identity.id,
+    ))
 
     # quem cria sempre recebe full access ao proprio secret
     owner_grant = SecretPermission(secret_id=secret.id, app_id=app_identity.id)
@@ -94,7 +104,18 @@ def create_secret(
 
 
 @router.get("/{name:path}", response_model=SecretValueOut)
-def read_secret(name: str, request: Request, db: Session = Depends(get_db), app_identity: AppIdentity = Depends(security.get_current_app)):
+def read_secret(
+    name: str,
+    request: Request,
+    version: int | None = Query(
+        default=None,
+        ge=1,
+        le=2_147_483_647,
+        description="Versão específica do secret (opcional; número inteiro >= 1)",
+    ),
+    db: Session = Depends(get_db),
+    app_identity: AppIdentity = Depends(security.get_current_app),
+):
     secret = db.query(Secret).filter(Secret.name == name).first()
     if not secret:
         raise HTTPException(status_code=404, detail={"error_code": "VLT-3001", "message": "secret nao encontrado"})
@@ -105,13 +126,39 @@ def read_secret(name: str, request: Request, db: Session = Depends(get_db), app_
             db.commit()
         raise HTTPException(status_code=403, detail={"error_code": "VLT-3002", "message": "App ID sem permissao de leitura neste secret"})
 
-    dek = crypto.decrypt_dek(MasterKeyHolder.get_master_key(), secret.encrypted_dek)
-    value = crypto.decrypt(dek, secret.ciphertext).decode("utf-8")
+    if version is not None:
+        target_version = db.query(SecretVersion).filter(
+            SecretVersion.secret_id == secret.id,
+            SecretVersion.version == version,
+        ).first()
+
+        if not target_version:
+            if version == secret.version:
+                encrypted_dek = secret.encrypted_dek
+                ciphertext = secret.ciphertext
+                ret_version = secret.version
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"error_code": "VLT-3004", "message": f"versao {version} do secret nao encontrada"},
+                )
+        else:
+            encrypted_dek = target_version.encrypted_dek
+            ciphertext = target_version.ciphertext
+            ret_version = target_version.version
+    else:
+        encrypted_dek = secret.encrypted_dek
+        ciphertext = secret.ciphertext
+        ret_version = secret.version
+
+    dek = crypto.decrypt_dek(MasterKeyHolder.get_master_key(), encrypted_dek)
+    value = crypto.decrypt(dek, ciphertext).decode("utf-8")
 
     if not is_database_in_recovery():
-        db.add(security.audit_event(request, app_identity, "secret.read", name))
+        detail_msg = f"version={ret_version}" if version is not None else None
+        db.add(security.audit_event(request, app_identity, "secret.read", name, detail=detail_msg))
         db.commit()
-    return SecretValueOut(id=secret.id, name=secret.name, version=secret.version, value=value)
+    return SecretValueOut(id=secret.id, name=secret.name, version=ret_version, value=value)
 
 
 @router.put("/{name:path}", response_model=SecretOut)
@@ -137,7 +184,16 @@ def update_secret(
     secret.ciphertext = crypto.encrypt(dek, payload.value.encode("utf-8"))
     secret.version += 1
 
-    db.add(security.audit_event(request, app_identity, "secret.update", name))
+    # armazena a nova versao no historico
+    db.add(SecretVersion(
+        secret_id=secret.id,
+        version=secret.version,
+        encrypted_dek=secret.encrypted_dek,
+        ciphertext=secret.ciphertext,
+        created_by=app_identity.id,
+    ))
+
+    db.add(security.audit_event(request, app_identity, "secret.update", name, detail=f"version={secret.version}"))
     db.commit()
     db.refresh(secret)
     return SecretOut(id=secret.id, name=secret.name, version=secret.version)
