@@ -33,5 +33,6 @@ admin-credentials.txt
 *.log
 *.tar
 *.tar.gz
+*.zip
 pgdata/
 teste.py
