@@ -11,6 +11,7 @@ requests.
 """
 import sys
 import base64
+from pathlib import Path
 
 from vault import config, crypto
 from vault.security import MasterKeyHolder
