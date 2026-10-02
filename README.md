@@ -188,19 +188,31 @@ Desempacota e valida o seed na máquina réplica (aceita arquivo ou stdin `-`):
 ```bash
 docker exec -i vault vaultctl unpack seed - < standby.seed.tar
 ```
+* **Nó virgem:** Desempacota os certificados e prepara o nó para o comando `vaultctl configure standby`.
+* **Nó já configurado (atualização de certificados):** Atualiza imediatamente os certificados corporativos/SANs em `$PGDATA/tls`, decifra para `/dev/shm/vault_tls` e recarrega os serviços em tempo real, sem necessidade de re-sincronizar o banco de dados.
 
 ### `vaultctl configure standby`
-Sincroniza o banco inicial via `pg_basebackup -R` com mTLS `verify-full` e inicia o streaming:
+Executado uma única vez na inicialização da réplica para sincronizar o banco inicial via `pg_basebackup -R` com mTLS `verify-full` e iniciar o streaming:
 ```bash
 docker exec vault vaultctl configure standby
 ```
+* **Re-sincronização:** Se desejar apagar o banco da réplica e forçar uma nova clonagem completa a partir do Líder, passe `--force`:
+  ```bash
+  docker exec vault vaultctl configure standby --force
+  ```
 
 ### `vaultctl ca issue`
-Reemite o certificado único de cluster adicionando novos SANs para novos nós:
+Reemite o certificado único de cluster adicionando novos SANs ou alterando o CN/hostname do cluster:
 ```bash
-docker exec -it vault vaultctl ca issue --force vault3.exemplo.com 10.10.30.30
+# Adicionar novos SANs mantendo os existentes:
+docker exec -it vault vaultctl ca issue --force 10.10.40.112 vault3.empresa.local
+
+# Alterar o CN e substituir a lista completa de SANs:
+docker exec -it vault vaultctl ca issue --force \
+    --hostname vault.empresa.local \
+    --replace 10.10.40.107 10.10.40.112 vault.empresa.local vault1.empresa.local vault2.empresa.local
 ```
-*Após reemitir o certificado, regenere os seeds dos nós e redistribua.*
+*Atualiza as chaves decifradas em memória (`tmpfs`), recarrega o PostgreSQL (`pg_ctl reload`) e o arquivo `cluster.json`. Em seguida, basta regenerar o seed para o nó Standby.*
 
 ### `vaultctl role promote`
 Promove um nó Standby para Líder de escrita com verificação anti-split-brain via HTTPS:
