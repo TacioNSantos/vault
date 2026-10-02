@@ -208,9 +208,6 @@ if [ -n "$TLS_DIR" ] && [ -f "$TLS_DIR/server.crt" ] && [ -f "$TLS_DIR/server.ke
         "--ssl-keyfile" "$TLS_DIR/server.key"
         "--ssl-certfile" "$TLS_DIR/server.crt"
     )
-    if [ -f "$TLS_DIR/ca.crt" ]; then
-        UVICORN_SSL_ARGS+=("--ssl-ca-certs" "$TLS_DIR/ca.crt")
-    fi
 fi
 
 touch /tmp/postgres-ready
