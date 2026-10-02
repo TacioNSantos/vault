@@ -37,7 +37,11 @@ Possui arquitetura de criptografia de envelope (Envelope Encryption), banco de d
 6. [Fluxo de Deploy Multi-Máquina (Passo a Passo)](#6-fluxo-de-deploy-multi-máquina-passo-a-passo)
    - [Cenário 1: Com PKI Interna (Certificados Autoassinados)](#cenário-1-com-pki-interna-certificados-autoassinados)
    - [Cenário 2: Com Certificados Próprios (BYO-Cert — PKI Corporativa)](#cenário-2-com-certificados-próprios-byo-cert--pki-corporativa)
-7. [Failover Manual com Trava Anti-Split-Brain](#7-failover-manual-com-trava-anti-split-brain)
+7. [Ciclo Completo de Failover, Reversão e Failback](#7-ciclo-completo-de-failover-reversão-e-failback)
+   - [7.1. Executando o Failover (Nó 2 vira o novo Líder)](#71-executando-o-failover-nó-2-vira-o-novo-líder)
+   - [7.2. Reanexando o Líder Antigo como Standby (Demote)](#72-reanexando-o-líder-antigo-como-standby-demote)
+   - [7.3. Executando o Failback (Retorno ao Nó 1)](#73-executando-o-failback-retorno-ao-nó-1)
+   - [7.4. Mapeamento de Parâmetros de Configuração nos Certificados X.509](#74-mapeamento-de-parâmetros-de-configuração-nos-certificados-x509)
 8. [Resgate de Emergência Offline (Break-Glass)](#8-resgate-de-emergência-offline-break-glass)
 9. [Referência Completa da API REST](#9-referência-completa-da-api-rest)
 10. [Dicionário de Códigos de Erro da Plataforma](#10-dicionário-de-códigos-de-erro-da-plataforma)
@@ -457,19 +461,115 @@ openssl req -new -nodes -out cluster.csr -newkey rsa:2048 -keyout cluster.key -c
 
 ---
 
-## 7. Failover Manual com Trava Anti-Split-Brain
+## 7. Ciclo Completo de Failover, Reversão e Failback
 
-Para promover um nó Standby com segurança:
+O Vault implementa governança de alta disponibilidade com proteção ativa contra **Split-Brain** (cenário em que dois nós acreditam ser Líder simultaneamente e gravam dados divergentes).
 
-1. **Desligue o container do Líder anterior:**
+```text
+ESTADO NORMAL:
+[ Nó 1: Líder (Escrita & Leitura) ] ── mTLS WAL ──> [ Nó 2: Standby (Somente Leitura) ]
+
+FAILOVER:
+1. Nó 1 cai / é desligado
+2. Nó 2 é promovido: [ Nó 2: Novo Líder (Escrita & Leitura) ]
+
+DEMOTE & REANEXAÇÃO:
+3. Nó 1 volta como Réplica:
+[ Nó 2: Novo Líder (Escrita & Leitura) ] ── mTLS WAL ──> [ Nó 1: Novo Standby (Somente Leitura) ]
+
+FAILBACK (OPCIONAL):
+4. Retorno ao estado original quando conveniente.
+```
+
+---
+
+### 7.1. Executando o Failover (Nó 2 vira o novo Líder)
+
+Quando o Nó 1 falhar ou precisar ser desligado para manutenção:
+
+1. **Garantir o desligamento do Líder antigo:**
    ```bash
-   docker stop vault
+   # No Nó 1 (se ainda estiver acessível):
+   sudo docker stop vault
    ```
-2. **Execute a promoção no Standby:**
+2. **Promover o Nó 2 (Standby) a Líder:**
    ```bash
-   docker exec -it vault vaultctl role promote
+   # No Nó 2:
+   sudo docker exec -it vault vaultctl role promote
    ```
-   *O comando executa checagem ativa contra o endpoint HTTPS do primário. Se o primário ainda estiver online e respondendo como master, a promoção é rejeitada (`VLT-5003`). Se o primário estiver desligado, a réplica assume a escrita (`role: primary`).*
+   * **Trava Anti-Split-Brain:** O comando executa uma checagem ativa via HTTPS contra o endpoint `/health` do Nó 1. Se o Nó 1 ainda estiver respondendo como `primary`, a promoção é **bloqueada imediatamente** (`VLT-5003`). Se o Nó 1 estiver inacessível, a promoção avança e o Nó 2 passa a responder como `role: primary` com capacidade total de escrita.
+   * *(Em caso de isolamento total de rede onde a checagem não tem resposta, use `--force`: `vaultctl role promote --force`).*
+
+---
+
+### 7.2. Reanexando o Líder Antigo como Standby (Demote)
+
+Quando o Nó 1 voltar após o incidente ou manutenção, ele **não pode** voltar a gravar dados. Ele deve ser rebaixado para **Standby** e passar a sincronizar a partir do Nó 2 (o novo Líder):
+
+1. **No Novo Líder (Nó 2 — `10.10.40.112`):**
+   Gere o seed para o Nó 1 apontando para o Nó 2 como primário:
+   ```bash
+   sudo docker exec vault vaultctl seed standby 10.10.40.107 --primary-host 10.10.40.112 --output /tmp/standby.seed.tar ; sudo docker cp vault:/tmp/standby.seed.tar ~/standby.seed.tar ; scp ~/standby.seed.tar k8s@10.10.40.107:~/
+   ```
+
+2. **No Nó 1 (`10.10.40.107`):**
+   Inicie o container, desempacote o seed e force a conversão para Standby:
+   ```bash
+   sudo docker start vault ; sudo docker exec -i vault vaultctl unpack seed - < ~/standby.seed.tar ; sudo docker exec vault vaultctl configure standby --force ; sudo docker restart vault
+   ```
+   *O `--force` limpa a base divergente do Nó 1, executa o `pg_basebackup -R` a partir do Nó 2 via mTLS e ativa o streaming de replicação.*
+
+3. **Confirmar a sincronização:**
+   * **No Nó 1:** `sudo docker exec -it vault vaultctl status` ➔ `Papel: STANDBY` e `status: streaming`.
+   * **No Nó 2:** `sudo docker exec -it vault vaultctl status` ➔ `Papel: PRIMARY` e `state: streaming`.
+
+---
+
+### 7.3. Executando o Failback (Retorno ao Nó 1)
+
+Se a política da organização exigir que o Nó 1 seja o Líder permanente:
+
+1. **Desligue o container no Nó 2:**
+   ```bash
+   sudo docker stop vault
+   ```
+2. **Promova o Nó 1 a Líder:**
+   ```bash
+   sudo docker exec -it vault vaultctl role promote
+   ```
+3. **No Nó 1, gere o seed para reanexar o Nó 2 como Standby:**
+   ```bash
+   sudo docker exec vault vaultctl seed standby 10.10.40.112 --primary-host 10.10.40.107 --output /tmp/standby.seed.tar ; sudo docker cp vault:/tmp/standby.seed.tar ~/standby.seed.tar ; scp ~/standby.seed.tar k8s@10.10.40.112:~/
+   ```
+4. **No Nó 2, reative como Standby:**
+   ```bash
+   sudo docker start vault ; sudo docker exec -i vault vaultctl unpack seed - < ~/standby.seed.tar ; sudo docker exec vault vaultctl configure standby --force ; sudo docker restart vault
+   ```
+
+---
+
+### 7.4. Mapeamento de Parâmetros de Configuração nos Certificados X.509
+
+Muitos operadores têm dúvidas sobre **quando** e **para onde** vai cada valor fornecido na configuração. A tabela abaixo esclarece o ciclo de vida:
+
+| Parâmetro CLI | Onde é gravado? | Vai para o Certificado TLS? | Campo X.509 no Certificado |
+| :--- | :--- | :--- | :--- |
+| **`--hostname <FQDN>`** | Certificado e `cluster.json` | **SIM** | `Subject: CN=<FQDN>` e `SAN: DNSName:<FQDN>` |
+| **`--altname <IP>`** | Certificado e `cluster.json` | **SIM** | `SAN: IPAddress:<IP>` |
+| **`--altname <DNS>`** | Certificado e `cluster.json` | **SIM** | `SAN: DNSName:<DNS>` |
+| **`127.0.0.1` e `localhost`** | Certificado | **SIM (Automático)** | `SAN: IPAddress:127.0.0.1` e `SAN: DNSName:localhost` |
+| **`--admin-ip <CIDR>`** | Banco de Dados (`app_identities`) | **NÃO** | *Não entra no certificado. É a política Zero-Trust do admin.* |
+| **`--primary-host`** | `cluster.json` e `postgresql.auto.conf` | **NÃO** | *Não entra no certificado. É o endereço de rede usado pelo Standby.* |
+| **`--cert`, `--key`, `--ca`** | Pasta `$PGDATA/tls/` | **SIM (BYO)** | *Importa o certificado corporativo já existente e valida os SANs.* |
+
+#### Em que momento o certificado é gerado ou alterado?
+1. **Momento 1 — No Bootstrap (`vaultctl configure primary`):**
+   * Se for autoassinado: a Root CA é criada e o certificado único do cluster é emitido com o `--hostname` e todos os `--altname`.
+   * Se for BYO: o Vault valida se os certificados fornecidos cobrem o `--hostname` e todos os `--altname`.
+2. **Momento 2 — Na Renovação ou Adição de Novos Nós (`vaultctl ca issue`):**
+   * Quando uma nova máquina entra no cluster (ex: IP `10.10.40.112`), executa-se `vaultctl ca issue --force <novo-ip>` no Líder.
+   * O certificado `cluster.crt` é reemitido com a Root CA incluindo os novos SANs.
+   * O comando `vaultctl seed standby` extrai esse novo certificado para que a réplica passe a utilizá-lo.
 
 ---
 
