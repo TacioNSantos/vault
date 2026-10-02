@@ -564,8 +564,9 @@ def ca_group():
 
 @ca_group.command("issue")
 @click.argument("hostnames", nargs=-1, required=True)
+@click.option("--replace", is_flag=True, default=False, help="Substitui a lista de SANs em vez de mesclar.")
 @click.option("--force", is_flag=True, default=False, help="Forca a reemissao do certificado de cluster.")
-def ca_issue(hostnames, force):
+def ca_issue(hostnames, replace, force):
     """Reemite o certificado do cluster incluindo novos SANs (hostnames/IPs)."""
     pgdata = get_pgdata()
     cluster_file = pgdata / "cluster.json"
@@ -590,10 +591,13 @@ def ca_issue(hostnames, force):
     ca_cert = pki.load_certificate(ca_crt_path.read_bytes())
     ca_key = pki.decrypt_private_key(ca_key_enc_path.read_bytes(), master_key)
 
-    # Mescla SANs existentes com os novos
-    current_altnames = set(cluster_meta.get("altnames", []))
-    current_altnames.update(hostnames)
-    new_altnames = sorted(list(current_altnames))
+    # Define novos SANs (substitui ou mescla)
+    if replace:
+        new_altnames = sorted(list(set(hostnames)))
+    else:
+        current_altnames = set(cluster_meta.get("altnames", []))
+        current_altnames.update(hostnames)
+        new_altnames = sorted(list(current_altnames))
 
     hostname = cluster_meta.get("hostname", "vault-cluster")
     cluster_cert, cluster_key = pki.create_cluster_certificate(
@@ -602,6 +606,13 @@ def ca_issue(hostnames, force):
 
     # Salva no disco cifrado
     pki.save_cluster_pki_to_disk(tls_dir, master_key, ca_cert, cluster_cert, cluster_key, ca_key)
+
+    # Atualiza chaves decifradas no tmpfs em memoria para o Postgres e Uvicorn
+    try:
+        pki.install_keys_to_tmpfs(tls_dir, master_key)
+        subprocess.run(["gosu", "postgres", "pg_ctl", "-D", str(pgdata), "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
     # Atualiza cluster.json
     cluster_meta["altnames"] = new_altnames
