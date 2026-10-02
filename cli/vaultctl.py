@@ -271,12 +271,13 @@ def configure_primary(hostname, altnames, admin_name, admin_ip, admin_secret_std
 
 
 @configure_group.command("standby")
-def configure_standby():
+@click.option("--force", is_flag=True, default=False, help="Forca a re-sincronizacao do standby com novo backup.")
+def configure_standby(force):
     """Configura o no como Standby (Replica) utilizando os dados do seed desempacotado."""
     pgdata = get_pgdata()
     cluster_file = pgdata / "cluster.json"
-    if cluster_file.is_file():
-        raise click.ClickException("[VLT-1006] O cofre ja esta configurado neste no.")
+    if cluster_file.is_file() and not force:
+        raise click.ClickException("[VLT-1006] O cofre ja esta configurado neste no. Se deseja re-sincronizar do zero, use --force.")
 
     stage_dir = get_seed_stage_dir()
     seed_json = stage_dir / "seed.json"
@@ -548,6 +549,25 @@ def unpack_seed(seed_source):
             "Certifique-se de que a mesma master.key do lider foi entregue e montada."
         )
 
+    # Se o no ja estiver configurado, atualiza imediatamente os certificados no volume
+    cluster_file = pgdata / "cluster.json"
+    if cluster_file.is_file():
+        tls_dir = pgdata / "tls"
+        tls_dir.mkdir(parents=True, exist_ok=True)
+        for fname in ("ca.crt", "cluster.crt", "cluster.key.enc", "ca.key.enc"):
+            src = stage_dir / fname
+            if src.is_file():
+                shutil.copyfile(str(src), str(tls_dir / fname))
+        try:
+            pki.install_keys_to_tmpfs(tls_dir, master_key)
+            subprocess.run(["gosu", "postgres", "pg_ctl", "-D", str(pgdata), "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        click.echo(
+            "[SUCESSO] Seed desempacotado e certificados do cluster atualizados com sucesso no no configurado."
+        )
+        return
+
     click.echo(
         "[SUCESSO] Seed desempacotado e validado com sucesso. "
         "Execute 'vaultctl configure standby' para sincronizar o no."
@@ -565,9 +585,10 @@ def ca_group():
 
 @ca_group.command("issue")
 @click.argument("hostnames", nargs=-1, required=True)
+@click.option("--hostname", default=None, help="Atualiza o Common Name (CN/hostname principal) do cluster.")
 @click.option("--replace", is_flag=True, default=False, help="Substitui a lista de SANs em vez de mesclar.")
 @click.option("--force", is_flag=True, default=False, help="Forca a reemissao do certificado de cluster.")
-def ca_issue(hostnames, replace, force):
+def ca_issue(hostnames, hostname, replace, force):
     """Reemite o certificado do cluster incluindo novos SANs (hostnames/IPs)."""
     pgdata = get_pgdata()
     cluster_file = pgdata / "cluster.json"
@@ -600,9 +621,9 @@ def ca_issue(hostnames, replace, force):
         current_altnames.update(hostnames)
         new_altnames = sorted(list(current_altnames))
 
-    hostname = cluster_meta.get("hostname", "vault-cluster")
+    cluster_hostname = hostname or cluster_meta.get("hostname", "vault-cluster")
     cluster_cert, cluster_key = pki.create_cluster_certificate(
-        ca_cert, ca_key, hostname, new_altnames
+        ca_cert, ca_key, cluster_hostname, new_altnames
     )
 
     # Salva no disco cifrado
@@ -616,6 +637,7 @@ def ca_issue(hostnames, replace, force):
         pass
 
     # Atualiza cluster.json
+    cluster_meta["hostname"] = cluster_hostname
     cluster_meta["altnames"] = new_altnames
     cluster_file.write_text(json.dumps(cluster_meta, indent=2), encoding="utf-8")
 
