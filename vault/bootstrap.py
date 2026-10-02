@@ -27,8 +27,20 @@ class BootstrapError(Exception):
 
 
 def load_master_key_from_file() -> bytes:
+    key_path = Path(config.MASTER_KEY_FILE)
+    if key_path.is_dir():
+        if (key_path / "master.key").is_file():
+            key_path = key_path / "master.key"
+        else:
+            raise BootstrapError(
+                "VLT-1001",
+                f"'{key_path}' e um diretorio, nao um arquivo. "
+                "O Docker cria uma pasta com esse nome quando o arquivo nao existia no host no momento do 'docker run'. "
+                "Remova o diretorio falso no host com 'rm -rf' e recrie como arquivo antes de subir o container.",
+            )
+
     try:
-        with open(config.MASTER_KEY_FILE, "r") as f:
+        with open(key_path, "r") as f:
             raw = f.read().strip()
     except FileNotFoundError:
         raise BootstrapError(

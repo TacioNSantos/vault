@@ -51,8 +51,17 @@ def get_seed_stage_dir() -> Path:
     return Path(os.environ.get("SEED_STAGE_DIR", "/tmp/vault_seed_stage")).expanduser().resolve()
 
 
-def load_master_key() -> bytes:
-    key_path = get_master_key_file()
+def load_master_key(override_path: Optional[str] = None) -> bytes:
+    key_path = Path(override_path).expanduser().resolve() if override_path else get_master_key_file()
+    if key_path.is_dir():
+        if (key_path / "master.key").is_file():
+            key_path = key_path / "master.key"
+        else:
+            raise click.ClickException(
+                f"[VLT-1001] '{key_path}' e um DIRETORIO, nao um arquivo. "
+                "O Docker cria uma pasta com esse nome quando o arquivo nao existia no host no 'docker run'. "
+                "Remova a pasta no host com 'rm -rf ~/secrets/master.key', crie o arquivo e recrie o container."
+            )
     if not key_path.is_file():
         raise click.ClickException(
             f"[VLT-1001] master.key nao encontrada em {key_path}. "
@@ -282,18 +291,10 @@ def configure_standby():
     primary_port = meta.get("primary_port", 5432)
     master_key = load_master_key()
 
-    # Move os certificados e chaves cifradas do seed_stage para $PGDATA/tls
-    tls_dir = pgdata / "tls"
-    tls_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ("ca.crt", "cluster.crt", "cluster.key.enc", "ca.key.enc"):
-        src = stage_dir / fname
-        if src.is_file():
-            shutil.copyfile(str(src), str(tls_dir / fname))
+    # 1. Decifra chaves para tmpfs DIRETAMENTE a partir do seed_stage (sem tocar no PGDATA)
+    tmpfs_dir = pki.install_keys_to_tmpfs(stage_dir, master_key)
 
-    # Decifra chaves para tmpfs para o pg_basebackup usar mTLS
-    tmpfs_dir = pki.install_keys_to_tmpfs(tls_dir, master_key)
-
-    # Aguarda o nó primário responder
+    # 2. Aguarda o nó primário responder via mTLS
     click.echo(f"Aguardando conectividade com o primario em {primary_host}:{primary_port}...")
     env = os.environ.copy()
     env["PGSSLMODE"] = "verify-full"
@@ -317,16 +318,15 @@ def configure_standby():
         pki.shred_tmpfs_keys(str(tmpfs_dir))
         raise click.ClickException(f"[VLT-1003] Falha ao alcancar o primario em {primary_host}:{primary_port} via mTLS.")
 
-    # Limpa arquivos residuais do pgdata antes do basebackup para evitar erro "directory exists but is not empty"
-    for item in pgdata.iterdir():
-        if item.name == "tls":
-            continue
-        if item.is_dir():
-            shutil.rmtree(str(item), ignore_errors=True)
-        else:
-            item.unlink(missing_ok=True)
+    # 3. Esvazia 100% o PGDATA para o pg_basebackup executar sem erros de diretorio nao vazio
+    if pgdata.exists():
+        for item in pgdata.iterdir():
+            if item.is_dir():
+                shutil.rmtree(str(item), ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
 
-    # Executa pg_basebackup via mTLS
+    # 4. Executa pg_basebackup via mTLS na pasta totalmente limpa
     click.echo(f"Sincronizando banco inicial a partir de {primary_host}...")
     backup_cmd = [
         "gosu", "postgres", "pg_basebackup",
@@ -339,7 +339,8 @@ def configure_standby():
         pki.shred_tmpfs_keys(str(tmpfs_dir))
         raise click.ClickException("[VLT-1003] Falha no pg_basebackup a partir do lider.")
 
-    # Restaura certificados tls no volume (se basebackup tiver limpado)
+    # 5. APOS o basebackup terminar, grava a pasta tls definitiva no volume
+    tls_dir = pgdata / "tls"
     tls_dir.mkdir(parents=True, exist_ok=True)
     for fname in ("ca.crt", "cluster.crt", "cluster.key.enc", "ca.key.enc"):
         src = stage_dir / fname

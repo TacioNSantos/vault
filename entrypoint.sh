@@ -123,6 +123,9 @@ TLS_DIR=""
 PG_SSL_OPTS=""
 
 if [ -f "$PGDATA/tls/cluster.crt" ] && [ -f "$PGDATA/tls/cluster.key.enc" ]; then
+    if [ -d "$MASTER_KEY_FILE" ] && [ -f "$MASTER_KEY_FILE/master.key" ]; then
+        MASTER_KEY_FILE="$MASTER_KEY_FILE/master.key"
+    fi
     if [ ! -f "$MASTER_KEY_FILE" ]; then
         echo "[VLT-1001] master.key nao encontrada em $MASTER_KEY_FILE ao carregar certificados do cluster." >&2
         exit 1
